@@ -36,6 +36,11 @@ def rfc3339(t: dt.datetime) -> str:
     return t.strftime("%Y-%m-%dT%H:%M:%S.") + f"{t.microsecond // 1000:03d}Z"
 
 
+def rfc3339_us(t: dt.datetime) -> str:
+    """Microsecond timestamps for raw evidence logs (replay must reproduce the live timing)."""
+    return t.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 @dataclasses.dataclass
 class FusionContext:
     device_id: str = "cellguard-001"
@@ -139,7 +144,6 @@ class Collector:
             if p is not None and "cgd" not in p and t_rx - p["t_rx"] < self.ctx.raw_join_s:
                 p["cgd"] = msg
                 self.counters["cgd_joined"] += 1
-        self._maybe_complete()
 
     def _new_boot_epoch(self) -> None:
         self.flush()
@@ -183,16 +187,13 @@ class Collector:
         self.tick(self.t_of(session.t.now_utc()))
 
     def tick(self, now: float) -> None:
+        """A slot is written when the next CGT arrives or ``flush_after_s`` after its CGT, never
+        earlier: the next CGT refines the Nano clock offset used for ``t_sim_s`` (generator rule)."""
         if self.pending is not None and now >= self.pending["t_rx"] + self.ctx.flush_after_s:
             self.flush()
         if self.ctx.live_gap_s is not None and self.pending is None and self.last_t is not None:
             while now - self.last_t >= self.ctx.live_gap_s:
                 self._emit_missing(round(self.last_t + self.ctx.period_s, 3))
-
-    def _maybe_complete(self) -> None:
-        p = self.pending
-        if p is not None and "cgs" in p and ("cgd" in p or not self.request_raw):
-            self.flush()
 
     # ---------------------------------------------------------------- output
     def flush(self) -> None:
@@ -234,11 +235,12 @@ class Collector:
         for k in range(1, n + 1):
             self._emit_missing(round(base + k * per, 3))
 
-    def _current(self, t_sample: float) -> Record:
+    def _current(self, t_sample: float, t_avail: float) -> Record:
         if self.current is None:
             reading = CurrentReading(None, "INA219_UNAVAILABLE", None)
         else:
-            reading = self.current.reading_at(self.utc_of(t_sample - self.ctx.time_guard_s))
+            reading = self.current.reading_at(self.utc_of(t_sample - self.ctx.time_guard_s),
+                                              available_by=self.utc_of(t_avail), age_ref=self.utc_of(t_sample))
         age = None
         if reading.sampled_utc is not None:
             age = round(t_sample - self.t_of(reading.sampled_utc), 3)
@@ -248,7 +250,7 @@ class Collector:
                 "ina219_sampled_utc": rfc3339(reading.sampled_utc) if reading.sampled_utc else None,
                 "current_age_s": age}
 
-    def _base(self, t: float) -> Record:
+    def _base(self, t: float, t_avail: float) -> Record:
         version: Optional[Version] = self.s.version
         sim_build = version is not None and version.flag("HOST_SIM_BUILD")
         rec: Record = {"schema_version": "normalized_sample_v1"}
@@ -261,7 +263,7 @@ class Collector:
         rec["fault_request_last_ended"] = ended
         rec["fault_modeled_applied"] = None    # no model for measured data
         rec["fault_physical_observed"] = None  # no physical feedback exists; never inferred
-        rec.update(self._current(t))
+        rec.update(self._current(t, t_avail))
         rec["_sim_build"] = sim_build
         return rec
 
@@ -297,7 +299,7 @@ class Collector:
     def _emit(self, p: dict) -> None:
         f: Telemetry = p["cgt"]
         t = p["t_est"]
-        rec = self._base(t)
+        rec = self._base(t, p["t_rx"])  # current: only readings the Pi had when the CGT arrived
         rec.update({"record_status": "OK", "nano_boot_epoch": p["epoch"], "nano_millis": f.millis,
                     "telemetry_seq": f.seq, "pi_received_utc": rfc3339(self.utc_of(p["t_rx"]))})
         cells = [None if mv is None else mv / 1000.0 for mv in f.cell_mv]
@@ -326,7 +328,7 @@ class Collector:
         self.counters["records_ok"] += 1
 
     def _emit_missing(self, t: float) -> None:
-        rec = self._base(t)
+        rec = self._base(t, t + 0.05)
         rec.update({"record_status": "MISSING_TELEMETRY", "nano_boot_epoch": self.boot_epoch, "nano_millis": None,
                     "telemetry_seq": None, "pi_received_utc": None,
                     "cell_voltage_v": [None] * 4, "cumulative_tap_voltage_v": [None] * 4,

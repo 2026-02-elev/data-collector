@@ -184,3 +184,47 @@ def test_fault_tracker_semantics():
     # A Nano reset ends everything.
     ft.on_event(p.Event(0, 0, "BOOT", 0, 8, 0, "WATCHDOG"), at(4000))
     assert ft.requested == {} and ft.last_ended["reason"] == "NANO_RESET"
+
+
+def test_ina219_raw_log_round_trip_and_replay_merge(tmp_path):
+    from cg_collector.replay import read_ina219_log
+    import json
+
+    raw = {"shunt_register": 65136, "shunt_lsb_v": 10e-6, "shunt_ohm": 0.1, "sign_correction": 1}
+    readings = []
+    for k in range(60):  # 10 Hz, each value known to the Pi 2 ms after its sample
+        t = at(900 + 100 * k)
+        readings.append(CurrentReading(round(-0.4 - 0.001 * k, 6), "VALID", t, t + dt.timedelta(milliseconds=2), raw))
+    path = tmp_path / "ina219-0001.jsonl"
+    path.write_text("".join(json.dumps(r.to_raw_record()) + "\n" for r in readings))
+    back = [r for _, _, r in read_ina219_log([path])]
+    assert back == readings
+    assert json.loads(path.read_text().splitlines()[0])["schema_version"] == "ina219_raw_v1"
+
+    out = []
+    replay(telemetry_lines(range(4)), FusionContext(run_id="r"), out.append, run_start=T0,
+           ina219=read_ina219_log([path]))
+    ok = [r for r in out if r["record_status"] == "OK"]
+    # slot 1 s: Nano sample at 1.000 s; newest INA219 sample at or before 1.000 s - 5 ms guard is 0.900 s
+    assert ok[0]["current_quality"] == "VALID" and ok[0]["pack_current_a"] == -0.4
+    assert ok[0]["ina219_sampled_utc"].startswith("2026-10-14T12:00:00.9") and ok[0]["current_age_s"] == 0.1
+    assert all(r["current_quality"] == "VALID" for r in ok)
+    # without the INA219 log the same frames say the sensor was unavailable (never 0 A)
+    out2 = []
+    replay(telemetry_lines(range(4)), FusionContext(run_id="r"), out2.append, run_start=T0)
+    assert {r["current_quality"] for r in out2 if r["record_status"] == "OK"} == {"INA219_UNAVAILABLE"}
+
+
+def test_replay_streams_its_input():
+    pulled = []
+
+    def lazy():
+        for item in telemetry_lines(range(50)):
+            pulled.append(item)
+            yield item
+
+    first_record_after = []
+    replay(lazy(), FusionContext(run_id="r"), lambda rec: first_record_after.append(len(pulled)), run_start=T0)
+    total = len(pulled)
+    assert total == 150
+    assert first_record_after[0] < 10  # records are written while the log is still being read

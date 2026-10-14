@@ -12,8 +12,8 @@ from typing import Iterator, Optional, Sequence
 
 from .current import CurrentSampler, Ina219
 from .events import EventRecorder
-from .fusion import Collector, FusionContext, rfc3339
-from .replay import read_collector_log, read_generator_log, replay
+from .fusion import Collector, FusionContext, rfc3339_us
+from .replay import read_collector_log, read_ina219_log, replay, replay_generator_run
 from .runner import PlanError, Pump, RunAborted, load_plan, parse_plan, run_steps, shell_command
 from .session import CommandTimeout, NanoSession, Received
 from .storage import Outbox, RotatingWriter
@@ -37,19 +37,28 @@ def collection(a: argparse.Namespace, session: NanoSession) -> Iterator[Collecto
     raw = RotatingWriter(data_dir, "raw", **kw)
     samples = RotatingWriter(data_dir, "samples", **kw)
     events = RotatingWriter(data_dir, "events", **kw)
+    run_start = clock()
+    # first raw record: the run's time origin (t_sim_s = 0), so a replay reproduces t_sim_s
+    raw.write_record({"dir": "RUN", "run_start_utc": rfc3339_us(run_start), "run_id": a.run_id,
+                      "device_id": a.device_id, "pack_id": a.pack_id, "scenario_id": a.scenario_id})
 
     def log_rx(rec: Received) -> None:
-        raw.write_record({"pi_received_utc": rfc3339(rec.utc), "dir": "N>P", "frame": rec.raw, "error": rec.error})
+        raw.write_record({"pi_received_utc": rfc3339_us(rec.utc), "dir": "N>P", "frame": rec.raw, "error": rec.error})
 
     def log_tx(utc: dt.datetime, frame: str) -> None:
-        raw.write_record({"pi_sent_utc": rfc3339(utc), "dir": "P>N", "frame": frame})
+        raw.write_record({"pi_sent_utc": rfc3339_us(utc), "dir": "P>N", "frame": frame})
 
     session.subscribe(log_rx)
     session.on_transmit(log_tx)
     sampler: Optional[CurrentSampler] = None
+    ina_log: Optional[RotatingWriter] = None
     if a.ina219:
         source = Ina219(bus=a.i2c_bus, address=int(a.i2c_address, 0), shunt_ohm=a.shunt_ohm, sign=a.current_sign)
         sampler = CurrentSampler(source, period_s=0.1)
+        # every INA219 read (value, sample / availability time, quality, register) as raw evidence;
+        # written only from the sampler thread
+        ina_log = RotatingWriter(data_dir, "ina219", **kw)
+        sampler.on_sample(lambda r: ina_log.write_record(r.to_raw_record()))
         sampler.start()
 
     ctx = FusionContext(device_id=a.device_id, pack_id=a.pack_id, run_id=a.run_id, scenario_id=a.scenario_id,
@@ -64,7 +73,8 @@ def collection(a: argparse.Namespace, session: NanoSession) -> Iterator[Collecto
     def write_event(rec: dict) -> None:
         events.write_record(rec)
 
-    collector = Collector(session, ctx, write_sample, current=sampler, request_raw=not a.no_raw)
+    collector = Collector(session, ctx, write_sample, current=sampler, request_raw=not a.no_raw,
+                          run_start_utc=run_start)
     EventRecorder(session, collector, write_event)
     # raw_log_ref always names the raw file being written at that moment
     session.subscribe(lambda _r: setattr(ctx, "raw_log_ref", raw.current_name or "raw-log-unset"))
@@ -74,8 +84,9 @@ def collection(a: argparse.Namespace, session: NanoSession) -> Iterator[Collecto
         collector.close()
         if sampler:
             sampler.stop()
-        for w in (raw, samples, events):
-            w.close()
+        for w in (raw, samples, events, ina_log):
+            if w is not None:
+                w.close()
 
 
 def _replay(a: argparse.Namespace) -> int:
@@ -83,25 +94,53 @@ def _replay(a: argparse.Namespace) -> int:
     out.mkdir(parents=True, exist_ok=True)
     ctx = FusionContext(device_id=a.device_id, pack_id=a.pack_id, run_id=a.run_id or "replay",
                         scenario_id=a.scenario_id)
-    end = None
-    if a.from_generator:
-        run = Path(a.from_generator)
-        man = json.loads((run / "manifest.json").read_text())
-        epoch = dt.datetime.fromisoformat(man["fixed_epoch_utc"].replace("Z", "+00:00"))
-        ctx.run_id, ctx.scenario_id = a.run_id or man["run_id"], man["scenario_id"]
-        lines = read_generator_log(run / "nano_uart.log", epoch)
-        start, end = epoch, epoch + dt.timedelta(seconds=float(man["duration_s"]))
-        ctx.raw_log_ref = str(run / "nano_uart.log")
-    else:
-        lines = read_collector_log([Path(x) for x in a.from_raw])
-        start = None
-        ctx.raw_log_ref = ",".join(Path(x).name for x in a.from_raw)
-    with open(out / "samples.jsonl", "w", encoding="utf-8") as fs, open(out / "events.jsonl", "w",
-                                                                          encoding="utf-8") as fe:
-        col = replay(lines, ctx, lambda r: fs.write(json.dumps(r, separators=(",", ":")) + "\n"),
-                     lambda r: fe.write(json.dumps(r, separators=(",", ":")) + "\n"), run_start=start, end_utc=end)
+    fs = open(out / "samples.jsonl", "w", encoding="utf-8")
+    fe = open(out / "events.jsonl", "w", encoding="utf-8")
+    sample_sink = lambda r: fs.write(json.dumps(r, separators=(",", ":")) + "\n")  # noqa: E731
+    event_sink = lambda r: fe.write(json.dumps(r, separators=(",", ":")) + "\n")  # noqa: E731
+    try:
+        if a.from_generator:
+            run = Path(a.from_generator)
+            man = json.loads((run / "manifest.json").read_text())
+            ctx.run_id, ctx.scenario_id = a.run_id or man["run_id"], man["scenario_id"]
+            ctx.raw_log_ref = str(run / "nano_uart.log")
+            col = replay_generator_run(run, ctx, sample_sink, event_sink)
+        else:
+            if a.from_dir:
+                d = Path(a.from_dir)
+                raws = sorted(d.glob("raw-*.jsonl"))
+                inas = sorted(d.glob("ina219-*.jsonl"))
+            else:
+                raws, inas = [Path(x) for x in a.from_raw], [Path(x) for x in (a.ina219_log or [])]
+            if not raws:
+                print("no raw-*.jsonl files", file=sys.stderr)
+                return 2
+            start, header = _run_header(raws[0])
+            if header:
+                ctx.run_id = a.run_id or header.get("run_id") or ctx.run_id
+                ctx.device_id = header.get("device_id", ctx.device_id)
+                ctx.pack_id = header.get("pack_id", ctx.pack_id)
+                ctx.scenario_id = header.get("scenario_id", ctx.scenario_id)
+            ctx.raw_log_ref = ",".join(p.name for p in raws)
+            col = replay(read_collector_log(raws), ctx, sample_sink, event_sink, run_start=start,
+                         ina219=read_ina219_log(inas) if inas else None)
+    finally:
+        fs.close()
+        fe.close()
     print(json.dumps(col.counters), file=sys.stderr)
     return 0
+
+
+def _run_header(path: Path):
+    with open(path, encoding="utf-8") as f:
+        first = f.readline()
+    try:
+        r = json.loads(first)
+    except ValueError:
+        return None, None
+    if r.get("dir") != "RUN":
+        return None, None
+    return dt.datetime.fromisoformat(r["run_start_utc"].replace("Z", "+00:00")), r
 
 
 def _last_state(session: NanoSession) -> str:
@@ -148,8 +187,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sub.add_parser("outbox", help="list closed files waiting for server upload")
     rp = sub.add_parser("replay", help="rebuild samples/events offline from a UART log")
     src = rp.add_mutually_exclusive_group(required=True)
+    src.add_argument("--from-dir", help="a collector data directory's outbox (raw-*.jsonl + ina219-*.jsonl)")
     src.add_argument("--from-raw", nargs="+", help="this collector's raw-*.jsonl files (in order)")
     src.add_argument("--from-generator", help="a data-generator run directory (nano_uart.log + manifest.json)")
+    rp.add_argument("--ina219-log", nargs="+", help="ina219-*.jsonl files to merge (with --from-raw)")
     rp.add_argument("--out", required=True, help="output directory (samples.jsonl, events.jsonl)")
     a = p.parse_args(argv)
 

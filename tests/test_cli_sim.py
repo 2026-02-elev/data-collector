@@ -17,6 +17,8 @@ def rows(data_dir, kind):
 def test_monitor_writes_raw_and_samples(sim_path, tmp_path, normalized_schema):
     assert cli.main(["--sim", sim_path, "--data-dir", str(tmp_path), "--run-id", "m1", "monitor", "--seconds", "5"]) == 0
     samples, raw = rows(tmp_path, "samples"), rows(tmp_path, "raw")
+    assert raw[0]["dir"] == "RUN" and raw[0]["run_id"] == "m1"  # time origin for replays
+    raw = raw[1:]
     assert len(samples) >= 4 and raw
     for r in samples:
         jsonschema.validate(r, normalized_schema)
@@ -85,6 +87,14 @@ def test_replay_of_own_raw_log_reproduces_samples(sim_path, tmp_path):
     raws = sorted((tmp_path / "live" / "outbox").glob("raw-*.jsonl"))
     assert cli.main(["--run-id", "r1", "replay", "--from-raw", *map(str, raws), "--out", str(tmp_path / "rp")]) == 0
     again = [json.loads(l) for l in (tmp_path / "rp" / "samples.jsonl").read_text().splitlines()]
-    keys = ["record_status", "cell_voltage_v", "nano_adc_tap_raw", "esr_command_mask", "controller_state"]
-    strip = lambda rs: [tuple(json.dumps(r[k]) for k in keys) for r in rs if r["record_status"] == "OK"]
-    assert strip(again) == strip(live)
+    # identical records: same time origin (RUN header) and microsecond raw timestamps
+    assert [json.dumps(r, sort_keys=True) for r in again] == [json.dumps(r, sort_keys=True) for r in live
+                                                              if True] or _diff(again, live)
+
+
+def _diff(a, b):
+    for x, y in zip(a, b):
+        for k in x:
+            if x[k] != y.get(k):
+                raise AssertionError((x["t_sim_s"], k, x[k], y.get(k)))
+    raise AssertionError((len(a), len(b)))

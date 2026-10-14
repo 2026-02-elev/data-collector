@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from cg_collector.fusion import FusionContext
-from cg_collector.replay import read_generator_log, replay
+from cg_collector.replay import replay_generator_run
 
 ROOT = Path(__file__).resolve().parents[1]
 GEN = Path(os.environ.get("CELLGUARD_GENERATOR_DIR", ROOT.parent / "data-generator")) / "demo_outputs" / "runs"
@@ -29,7 +29,9 @@ EXACT = ["record_status", "telemetry_seq", "nano_millis", "nano_boot_epoch", "ce
          "pack_relay_commanded_known", "command_state_source", "esr_command_mask", "leak_command_mask",
          "heater_pwm_command", "trip_reason", "trip_code", "controller_state", "controller_locks", "fault_commanded",
          "voltage_quality", "voltage_quality_bits", "temperature_quality_mask", "fault_physical_observed",
-         "physical_fault_verified", "protocol_version", "schema_version"]
+         "physical_fault_verified", "protocol_version", "schema_version",
+         # INA219: rebuilt from ina219_raw.jsonl with the same selection rule
+         "pack_current_a", "current_quality", "ina219_sampled_utc", "current_age_s"]
 # Request tracking: the generator knows the true Nano event time, the collector estimates it from the
 # Nano clock (a few ms off), so a request change that falls within ~50 ms of a slot may land on either side.
 REQUEST = ["fault_requested", "power_requested"]
@@ -53,11 +55,8 @@ def _same_ended(a, b, tol_s=0.05):
 
 
 def _replay(run):
-    man = json.loads((run / "manifest.json").read_text())
-    epoch = dt.datetime.fromisoformat(man["fixed_epoch_utc"].replace("Z", "+00:00"))
     obs, events = [], []
-    col = replay(read_generator_log(run / "nano_uart.log", epoch), FusionContext(run_id=run.name), obs.append,
-                 events.append, run_start=epoch, end_utc=epoch + dt.timedelta(seconds=float(man["duration_s"])))
+    col = replay_generator_run(run, FusionContext(run_id=run.name), obs.append, events.append)
     return col, obs, events
 
 
