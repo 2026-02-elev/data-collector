@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cellguard.local/schemas/fault_event_v1.schema.json",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "source",
+    "run_id",
+    "scenario_id",
+    "event_id",
+    "event_type",
+    "fault_type",
+    "cell_id",
+    "timestamp_utc",
+    "t_sim_s",
+    "requested_value",
+    "commanded_value",
+    "applied_value",
+    "duration_s",
+    "physical_fault_verified",
+    "scenario_domain",
+    "evidence"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "fault_event_v1"
+    },
+    "source": {
+      "enum": [
+        "synthetic",
+        "measured_normal",
+        "measured_fault_injection"
+      ]
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scenario_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "event_type": {
+      "enum": [
+        "REQUESTED",
+        "COMMANDED",
+        "APPLIED",
+        "OBSERVABLE",
+        "RELEASED",
+        "TRIPPED",
+        "RESET",
+        "BOOT",
+        "FAULT_REJECTED"
+      ]
+    },
+    "fault_type": {
+      "enum": [
+        "NONE",
+        "ESR",
+        "LEAK",
+        "HEAT",
+        "SENSOR",
+        "UART",
+        "I2C"
+      ]
+    },
+    "cell_id": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 4
+    },
+    "timestamp_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "t_sim_s": {
+      "type": "number",
+      "minimum": 0
+    },
+    "requested_value": {},
+    "commanded_value": {},
+    "applied_value": {},
+    "duration_s": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "physical_fault_verified": {
+      "type": "boolean"
+    },
+    "scenario_domain": {
+      "enum": [
+        "hardware_compatible_model",
+        "simulation_only",
+        "simulation_only_boundary"
+      ]
+    },
+    "evidence": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "source": {
+            "const": "synthetic"
+          }
+        },
+        "required": [
+          "source"
+        ]
+      },
+      "then": {
+        "properties": {
+          "physical_fault_verified": {
+            "const": false
+          }
+        }
+      }
+    }
+  ]
+}

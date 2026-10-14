@@ -1,0 +1,371 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cellguard.local/schemas/normalized_sample_v1.schema.json",
+  "title": "CellGuard common normalized telemetry sample v1",
+  "description": "Model does not claim that synthetic data were physically measured. Null observation is never zero imputation.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "source",
+    "device_id",
+    "pack_id",
+    "run_id",
+    "scenario_id",
+    "timestamp_utc",
+    "t_sim_s",
+    "cell_voltage_v",
+    "cumulative_tap_voltage_v",
+    "cell_temperature_c",
+    "temperature_quality",
+    "pack_current_a",
+    "current_quality",
+    "charge_commanded",
+    "discharge_commanded",
+    "pack_relay_commanded",
+    "esr_command_mask",
+    "leak_command_mask",
+    "heater_pwm_command",
+    "trip_reason",
+    "controller_state",
+    "voltage_quality",
+    "fault_requested",
+    "fault_modeled_applied",
+    "physical_fault_verified",
+    "physical_harness_verified",
+    "calibration_id"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "normalized_sample_v1"
+    },
+    "source": {
+      "enum": [
+        "synthetic",
+        "measured_normal",
+        "measured_fault_injection"
+      ]
+    },
+    "device_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pack_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scenario_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "timestamp_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "t_sim_s": {
+      "type": "number",
+      "minimum": 0
+    },
+    "cell_voltage_v": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": [
+          "number",
+          "null"
+        ]
+      }
+    },
+    "cumulative_tap_voltage_v": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": [
+          "number",
+          "null"
+        ]
+      }
+    },
+    "cell_temperature_c": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": [
+          "number",
+          "null"
+        ]
+      }
+    },
+    "temperature_quality": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "enum": [
+          "VALID",
+          "SATURATED_OR_OPEN",
+          "SHORT_OR_LOW",
+          "ADC_INVALID",
+          "MISSING"
+        ]
+      }
+    },
+    "nano_adc_tap_raw": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 0,
+        "maximum": 1023
+      }
+    },
+    "nano_adc_ntc_raw": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 0,
+        "maximum": 1023
+      }
+    },
+    "pack_current_a": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "current_quality": {
+      "enum": [
+        "VALID",
+        "INA219_UNAVAILABLE",
+        "I2C_ERROR",
+        "MISSING",
+        "OUT_OF_RANGE"
+      ]
+    },
+    "charge_commanded": {
+      "type": "boolean"
+    },
+    "discharge_commanded": {
+      "type": "boolean"
+    },
+    "pack_relay_commanded": {
+      "type": "boolean"
+    },
+    "esr_command_mask": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 15
+    },
+    "leak_command_mask": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 15
+    },
+    "heater_pwm_command": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 255
+      }
+    },
+    "trip_reason": {
+      "type": [
+        "string",
+        "integer"
+      ]
+    },
+    "controller_state": {
+      "type": "string"
+    },
+    "voltage_quality": {
+      "enum": [
+        "VALID",
+        "ADC_SATURATED",
+        "TAP_INVERSION",
+        "AREF_INVALID",
+        "MISSING",
+        "OTHER_ERROR"
+      ]
+    },
+    "fault_requested": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "cell_id",
+            "active"
+          ],
+          "properties": {
+            "type": {
+              "enum": [
+                "NONE",
+                "ESR",
+                "LEAK",
+                "HEAT",
+                "SENSOR",
+                "UART",
+                "I2C"
+              ]
+            },
+            "cell_id": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "maximum": 4
+            },
+            "active": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "fault_modeled_applied": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "cell_id",
+            "active"
+          ],
+          "properties": {
+            "type": {
+              "enum": [
+                "NONE",
+                "ESR",
+                "LEAK",
+                "HEAT",
+                "SENSOR",
+                "UART",
+                "I2C"
+              ]
+            },
+            "cell_id": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "maximum": 4
+            },
+            "active": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "physical_fault_verified": {
+      "type": "boolean"
+    },
+    "physical_harness_verified": {
+      "type": "boolean"
+    },
+    "calibration_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "generator_version": {
+      "type": "string"
+    },
+    "seed": {
+      "type": "integer"
+    },
+    "config_hash": {
+      "type": "string"
+    },
+    "firmware_version": {
+      "type": "string"
+    },
+    "hardware_revision": {
+      "type": "string"
+    },
+    "raw_log_ref": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "source": {
+            "const": "synthetic"
+          }
+        },
+        "required": [
+          "source"
+        ]
+      },
+      "then": {
+        "required": [
+          "generator_version",
+          "seed",
+          "config_hash"
+        ],
+        "properties": {
+          "physical_fault_verified": {
+            "const": false
+          },
+          "physical_harness_verified": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "source": {
+            "enum": [
+              "measured_normal",
+              "measured_fault_injection"
+            ]
+          }
+        },
+        "required": [
+          "source"
+        ]
+      },
+      "then": {
+        "required": [
+          "hardware_revision",
+          "firmware_version",
+          "raw_log_ref"
+        ]
+      }
+    }
+  ]
+}

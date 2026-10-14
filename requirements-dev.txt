@@ -1,0 +1,5 @@
+# tested with
+pyserial==3.5
+pytest==9.1.1
+jsonschema==4.26.0
+PyYAML==6.0.1

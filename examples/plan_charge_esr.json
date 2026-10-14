@@ -1,0 +1,17 @@
+{
+  "description": "Supervised example: charge, inject ESR on cell 2 for 5 s, stop. Requires all hardware gates verified in the firmware build.",
+  "steps": [
+    "SYNC",
+    {"wait": 1},
+    "CAL",
+    "ARM",
+    {"cmd": "CHARGE", "args": [1]},
+    {"wait": 10},
+    {"cmd": "ESR", "args": [2, 1]},
+    {"wait": 5},
+    {"cmd": "ESR", "args": [2, 0]},
+    {"wait": 5},
+    {"cmd": "CHARGE", "args": [0]},
+    {"wait": 2}
+  ]
+}
