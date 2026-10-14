@@ -120,6 +120,7 @@ class Pump(threading.Thread):
             while not self.stop_event.is_set():
                 self.session.keepalive(self.heartbeat_s)
                 self.session.poll(0.05)
+                self.session.run_idle_hooks()
         except BaseException as exc:  # surfaced by the shell
             self.error = exc
 

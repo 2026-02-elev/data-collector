@@ -2,6 +2,7 @@
 # Author: Yongho Ahn <nanhosoft@gmail.com>
 from __future__ import annotations
 
+import bisect
 import collections
 import dataclasses
 import datetime as dt
@@ -28,14 +29,20 @@ class CommandTimeout(RuntimeError):
     pass
 
 
-class FaultTracker:
-    """Keeps three facts apart for every actuator:
+FAULT_ORDER = {"ESR": 0, "LEAK": 1, "HEAT": 2}
 
-    * requested - what this host asked for (set by an accepted command, ended by
-      a host stop *or* by any Nano-side stop event: TIMEOUT, TRIP, limits ...)
+
+class FaultTracker:
+    """Keeps three facts apart for every actuator (same semantics as the
+    data-generator's virtual Pi, so synthetic and measured records match):
+
+    * requested - what this host asked for. Set by an accepted command; ended
+      by a host stop (reason ``HOST``), by OFF/TRIP/SYNC (reason = command), by a
+      Nano-side stop event (its reason: TIMEOUT, TRIP, PACK_LIMIT ...) or by a
+      refusal (``REJECTED_<reason>``).
     * commanded - what the Nano reports it is driving (CGT masks / CGE events)
-    * physical  - never known here: there is no contact/current feedback per
-      fault, so it is always reported as unverified (null).
+    * physical  - never known here (no contact/current feedback per fault),
+      always reported as unverified (null).
     """
 
     STOP_EVENTS = {"CHARGE_STOP": "CHARGE", "DISCHARGE_STOP": "DISCHARGE", "ESR_STOP": "ESR",
@@ -44,50 +51,89 @@ class FaultTracker:
     def __init__(self) -> None:
         self.requested: Dict[Tuple[str, int], Dict[str, object]] = {}
         self.last_ended: Optional[Dict[str, object]] = None
+        # Maps a CGE to the time the Nano acted (set by the Collector once it knows the
+        # Nano clock offset); defaults to the Pi receive time.
+        self.event_clock: Callable[[Event, dt.datetime], dt.datetime] = lambda ev, rx_utc: rx_utc
+        # (utc, snapshot) after every change, so records for past slots (gap fill) see the
+        # state as of the slot time, not as of when they are written. Bounded.
+        self._hist_t: Deque[dt.datetime] = collections.deque(maxlen=4096)
+        self._hist_v: Deque[tuple] = collections.deque(maxlen=4096)
 
-    def _end(self, key: Tuple[str, int], reason: str, utc: dt.datetime) -> None:
+    def _snap(self, utc: dt.datetime) -> None:
+        if self._hist_t and utc < self._hist_t[-1]:
+            utc = self._hist_t[-1]  # keep the history monotonic
+        self._hist_t.append(utc)
+        self._hist_v.append((self.requested_struct(), self.power_requested(), self.last_ended))
+
+    def state_at(self, utc: dt.datetime) -> tuple:
+        """(fault_requested, power_requested, fault_request_last_ended) as of ``utc``."""
+        i = bisect.bisect_right(list(self._hist_t), utc)
+        if i == 0:
+            return None, {"charge": False, "discharge": False}, None
+        return self._hist_v[i - 1]
+
+    def _end(self, key: Tuple[str, int], reason: str, utc: dt.datetime, since: Optional[str] = None) -> None:
         req = self.requested.pop(key, None)
-        if req is not None:
+        if req is not None or since is not None:
             self.last_ended = {"type": key[0], "cell_id": key[1] or None, "reason": reason,
-                               "requested_since_utc": req["since_utc"], "ended_utc": _iso(utc)}
+                               "requested_since_utc": req["since_utc"] if req else since, "ended_utc": _iso(utc)}
 
     def _end_all(self, reason: str, utc: dt.datetime) -> None:
-        for key in list(self.requested):
+        for key in sorted(self.requested, key=lambda k: (FAULT_ORDER.get(k[0], 9), k[1])):
             self._end(key, reason, utc)
 
-    def on_ack(self, name: str, args: Sequence[int], ack: Ack, utc: dt.datetime) -> None:
+    @staticmethod
+    def _key_value(name: str, args: Sequence[int]) -> Optional[Tuple[Tuple[str, int], int]]:
+        if name in ("CHARGE", "DISCHARGE"):
+            return (name, 0), int(args[0])
+        if name in ("ESR", "LEAK", "HEAT"):
+            return (name, int(args[0])), int(args[1])
+        return None
+
+    def on_ack(self, name: str, args: Sequence[int], ack: Ack, utc: dt.datetime,
+               ack_utc: Optional[dt.datetime] = None) -> None:
+        """``utc`` = when the command was sent (request time), ``ack_utc`` = when the reply arrived."""
+        kv = self._key_value(name, args)
         if not ack.ok:
+            if kv is not None and kv[1]:  # requested from sending until the refusal arrived
+                key, value = kv
+                prev = self.requested.get(key)
+                self.requested[key] = {"value": value, "since_utc": prev["since_utc"] if prev else _iso(utc)}
+                self._snap(utc)
+                self._end(key, "REJECTED_" + ack.text, ack_utc or utc)
+                self._snap(ack_utc or utc)
             return
         if name in ("SYNC", "OFF", "TRIP"):
-            self._end_all("HOST_" + name, utc)
+            self._end_all(name, utc)
+        elif kv is None:
             return
-        if name in ("CHARGE", "DISCHARGE"):
-            key, value = (name, 0), int(args[0])
-        elif name in ("ESR", "LEAK", "HEAT"):
-            key, value = (name, int(args[0])), int(args[1])
         else:
-            return
-        if value:
-            self.requested.setdefault(key, {"value": value, "since_utc": _iso(utc)})["value"] = value
-        else:
-            self._end(key, "HOST", utc)
+            key, value = kv
+            if value:
+                self.requested.setdefault(key, {"value": value, "since_utc": _iso(utc)})["value"] = value
+            else:
+                self._end(key, "HOST", utc)
+        self._snap(utc)
 
     def on_event(self, ev: Event, utc: dt.datetime) -> None:
+        if ev.code == "BOOT":  # a Nano reset switched every output off
+            self._end_all("NANO_RESET", utc)
+            self._snap(utc)
+            return
         kind = self.STOP_EVENTS.get(ev.code)
-        if kind is not None:
-            self._end((kind, ev.cell_id if kind in ("ESR", "LEAK", "HEAT") else 0), ev.reason, utc)
-        elif ev.code == "TRIP":
-            self._end_all("TRIP_" + ev.reason, utc)
+        if kind is not None and ev.reason != "HOST":
+            at = self.event_clock(ev, utc)
+            self._end((kind, ev.cell_id if kind in FAULT_ORDER else 0), ev.reason, at)
+            self._snap(at)
 
     def requested_struct(self) -> Optional[Dict[str, object]]:
-        faults = [{"type": k[0], "cell_id": k[1], "active": True, "value": v["value"], "since_utc": v["since_utc"]}
-                  for k, v in sorted(self.requested.items()) if k[0] in ("ESR", "LEAK", "HEAT")]
+        faults = [{"type": k[0], "cell_id": k[1], "active": True, "value": v["value"]}
+                  for k, v in sorted(self.requested.items(), key=lambda kv: (FAULT_ORDER.get(kv[0][0], 9), kv[0][1]))
+                  if k[0] in FAULT_ORDER]
         if not faults:
             return None
-        first = dict(faults[0])
-        if len(faults) > 1:
-            first["all"] = faults
-        return first
+        return {"type": faults[0]["type"], "cell_id": faults[0]["cell_id"], "active": True, "count": len(faults),
+                "faults": faults}
 
     def power_requested(self) -> Dict[str, bool]:
         return {"charge": ("CHARGE", 0) in self.requested, "discharge": ("DISCHARGE", 0) in self.requested}
@@ -118,10 +164,31 @@ class NanoSession:
         self.faults = FaultTracker()
         self.last_ok_utc: Optional[dt.datetime] = None
         self._subscribers: List[Callable[[Received], None]] = []
+        self._tx_listeners: List[Callable[[dt.datetime, str], None]] = []
+        self._cmd_listeners: List[Callable[[str, Sequence[int], Ack, dt.datetime], None]] = []
+        self._idle_hooks: List[Callable[["NanoSession"], None]] = []
         self._lock = threading.RLock()
 
     def subscribe(self, fn: Callable[[Received], None]) -> None:
+        """Every received frame (also those arriving while a command waits for its ACK)."""
         self._subscribers.append(fn)
+
+    def on_transmit(self, fn: Callable[[dt.datetime, str], None]) -> None:
+        """Every frame sent to the Nano (for the raw log; retransmissions included)."""
+        self._tx_listeners.append(fn)
+
+    def on_command(self, fn: Callable[[str, Sequence[int], Ack, dt.datetime], None]) -> None:
+        """Every command that got an ACK: (name, args, ack, sent_utc)."""
+        self._cmd_listeners.append(fn)
+
+    def add_idle_hook(self, fn: Callable[["NanoSession"], None]) -> None:
+        """Called between receive polls (pump / shell pump), outside any command wait."""
+        self._idle_hooks.append(fn)
+
+    def run_idle_hooks(self) -> None:
+        with self._lock:
+            for fn in self._idle_hooks:
+                fn(self)
 
     # -- receive side --
     def _ingest(self, lines: Sequence[str]) -> List[Received]:
@@ -160,7 +227,11 @@ class NanoSession:
             seq = self.seq
             payload = ",".join(["CGC", str(seq), name] + [str(int(a)) for a in args])
             frame = encode_frame(payload)
+            sent_utc = self.t.now_utc()
             for _attempt in range(self.retries + 1):
+                now = self.t.now_utc()
+                for fn in self._tx_listeners:
+                    fn(now, frame.decode("ascii").rstrip("\n"))
                 self.t.write(frame)
                 deadline = self.t.now_utc() + dt.timedelta(seconds=self.ack_timeout_s)
                 while True:
@@ -168,7 +239,9 @@ class NanoSession:
                         if isinstance(rec.message, Ack) and rec.message.seq == seq:
                             if rec.message.ok:
                                 self.last_ok_utc = rec.utc
-                            self.faults.on_ack(name, args, rec.message, rec.utc)
+                            self.faults.on_ack(name, args, rec.message, sent_utc, rec.utc)
+                            for fn in self._cmd_listeners:
+                                fn(name, args, rec.message, sent_utc)
                             return rec.message
                     if self.t.now_utc() >= deadline:
                         break
@@ -189,6 +262,7 @@ class NanoSession:
             if keepalive_s is not None:
                 self.keepalive(keepalive_s)
             self.poll(step_s)
+            self.run_idle_hooks()
 
 
 def trip_name(code: int) -> str:

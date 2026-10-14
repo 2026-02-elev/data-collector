@@ -101,7 +101,8 @@
       "enum": [
         "hardware_compatible_model",
         "simulation_only",
-        "simulation_only_boundary"
+        "simulation_only_boundary",
+        "measured_hardware"
       ]
     },
     "evidence": {

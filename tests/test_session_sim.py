@@ -79,9 +79,10 @@ def test_no_telemetry_lost_while_commands_wait(sim, normalized_schema):
         s.poll(0.25)
     col.close()
     assert len(cgt) >= 10
-    assert col.count == len(cgt)  # every CGT became a record, none lost
+    oks = [r for r in out if r["record_status"] == "OK"]
+    assert len(oks) == len(cgt)  # every CGT became a record, none lost
     assert len(s.recent) <= 8 and len(col.recent) <= 32  # bounded memory
-    seqs = [r["nano_telemetry_seq"] for r in out]
+    seqs = [r["telemetry_seq"] for r in oks]
     assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
     for rec in out:
         jsonschema.validate(rec, normalized_schema)
@@ -134,3 +135,40 @@ def test_plan_validation():
                 {"steps": ["SYNC", {"cmd": "FLY"}]}, {"steps": ["SYNC", {"wait": -1}]}):
         with pytest.raises(PlanError):
             parse_plan(bad)
+
+
+class DropTelemetry(Transport):
+    """Loses CGT frames between two simulated times (receive side)."""
+
+    def __init__(self, inner, start_s, end_s):
+        self.inner, self.start_s, self.end_s = inner, start_s, end_s
+
+    def write(self, data):
+        self.inner.write(data)
+
+    def read_lines(self, timeout_s):
+        lines = self.inner.read_lines(timeout_s)
+        t = self.inner.sim_ms / 1000.0
+        return [l for l in lines if not (l.startswith("$CGT") and self.start_s <= t < self.end_s)]
+
+    def now_utc(self):
+        return self.inner.now_utc()
+
+    def close(self):
+        self.inner.close()
+
+
+def test_live_missing_telemetry_records(sim):
+    t = DropTelemetry(sim(), 3.5, 6.5)
+    s = NanoSession(t)
+    out = []
+    col = Collector(s, FusionContext(run_id="gap"), out.append)
+    s.command("SYNC")
+    s.pump(10)
+    col.close()
+    status = [r["record_status"] for r in out]
+    assert status.count("MISSING_TELEMETRY") >= 3
+    miss = [r for r in out if r["record_status"] == "MISSING_TELEMETRY" and r["t_sim_s"] > 2]
+    assert miss and all(r["cell_voltage_v"] == [None] * 4 for r in miss)
+    ts = [r["t_sim_s"] for r in out]
+    assert ts == sorted(ts) and all(0.9 <= b - a <= 1.1 for a, b in zip(ts, ts[1:]))

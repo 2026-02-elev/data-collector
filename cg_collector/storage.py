@@ -7,6 +7,7 @@ Layout under ``data_dir``::
     spool/<kind>-<start>-<n>.jsonl.part   file being written (flushed every record)
     outbox/<kind>-<start>-<n>.jsonl       closed files, ready to be sent to the server
     sent/<kind>-<start>-<n>.jsonl         files an uploader confirmed
+    quarantine/                           crash recovery reports and rejected partial lines
 
 Files rotate by size and age, so memory and single-file size stay bounded.
 Raw UART frames and normalized samples are stored separately: the raw log is
@@ -35,11 +36,11 @@ class RotatingWriter:
         self.max_bytes = max_bytes
         self.max_age_s = max_age_s
         self.clock = clock
-        for sub in ("spool", "outbox", "sent"):
+        for sub in ("spool", "outbox", "sent", "quarantine"):
             (self.dir / sub).mkdir(parents=True, exist_ok=True)
-        # A previous run that crashed leaves .part files: hand them to the outbox as they are.
-        for stale in sorted((self.dir / "spool").glob(f"{kind}-*.jsonl.part")):
-            os.replace(stale, self.dir / "outbox" / stale.name[:-len(".part")])
+        # A previous run that crashed leaves .part files: recover the valid records.
+        self.recovered = [recover_part(stale, self.dir) for stale in
+                          sorted((self.dir / "spool").glob(f"{kind}-*.jsonl.part"))]
         self._f = None
         self._path: Optional[Path] = None
         self._opened: Optional[dt.datetime] = None
@@ -92,6 +93,47 @@ class RotatingWriter:
 
     def close(self) -> Optional[Path]:
         return self.rotate()
+
+
+def recover_part(part: Path, data_dir: Path) -> dict:
+    """Moves an unfinished spool file to the outbox keeping only complete, valid JSON lines.
+
+    A crash usually leaves a truncated last line; any line that does not parse
+    as a JSON object is moved byte-for-byte to ``quarantine/`` (never silently
+    dropped) and a ``<name>.recovery.json`` report is written next to it.
+    """
+    data_dir = Path(data_dir)
+    name = part.name[:-len(".part")]
+    raw = part.read_bytes()
+    good: List[bytes] = []
+    bad: List[bytes] = []
+    lines = raw.split(b"\n")
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        complete = i < len(lines) - 1  # the last element has no terminating newline
+        try:
+            ok = complete and isinstance(json.loads(line.decode("utf-8")), dict)
+        except (UnicodeDecodeError, ValueError):
+            ok = False
+        (good if ok else bad).append(line)
+    final = data_dir / "outbox" / name
+    tmp = final.with_suffix(".jsonl.tmp")
+    with open(tmp, "wb") as f:
+        for line in good:
+            f.write(line + b"\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, final)
+    report = {"file": name, "recovered_records": len(good), "quarantined_lines": len(bad),
+              "original_bytes": len(raw)}
+    if bad:
+        with open(data_dir / "quarantine" / (name + ".rejected"), "wb") as f:
+            for line in bad:
+                f.write(line + b"\n")
+    (data_dir / "quarantine" / (name + ".recovery.json")).write_text(json.dumps(report), encoding="utf-8")
+    part.unlink()
+    return report
 
 
 class Uploader:
