@@ -22,9 +22,10 @@ cg_collector/
   replay.py     raw UART 로그(수집기 raw-*.jsonl 또는 생성기 nano_uart.log) → samples/events 재생성
   storage.py    RotatingWriter(spool → outbox, 크기/시간 회전, 비정상 종료 .part 검증 복구), Outbox + Uploader 인터페이스
   runner.py     실험 시퀀스 실행기(한 세션 유지), 대화형 shell 용 Pump 스레드
-  cli.py        cg-collect monitor | run | shell | query | outbox | replay
+  preflight.py  부팅 점검(테스트 모드): 링크·펌웨어·Nano 자체점검·상태·텔레메트리·측정·ADC 경로·INA219·시계·저장소
+  cli.py        cg-collect selftest | monitor | run | shell | query | outbox | replay
 schemas/        normalized_sample_v1, fault_event_v1 (합성기와 공통 계약)
-examples/       plan_charge_esr.json (감독하 실험 계획 예시)
+examples/       plan_charge_esr.json (감독하 실험 계획 예시), cellguard-collector.service (부팅 시 자동 시작)
 tests/          단위시험 + 펌웨어 호스트 시뮬레이터 통합시험
 ```
 
@@ -52,7 +53,7 @@ cg-collect --port /dev/serial0 run examples/plan_charge_esr.json --i-am-supervis
 
 # 대화형 제어: 세션 유지, 백그라운드 하트비트/수집
 cg-collect --port /dev/serial0 shell --i-am-supervising
-#   > arm / charge 1 / esr 2 1 / status / off / quit
+#   > arm / charge 1 / esr 2 1 / status / selftest / off / quit   (selftest = Nano 자체점검 재실행, 출력 OFF 상태에서만)
 
 # 단발 조회(읽기 전용): ping | status | raw | cal
 cg-collect --port /dev/serial0 query status
@@ -68,6 +69,53 @@ cg-collect --sim ../arudino-firmware/tests/host/build/nano_host_sim --sim-gates 
 ```
 
 Pi 준비: `raspi-config` → Interface Options → Serial Port (login shell **No**, serial hardware **Yes**), I²C 활성화(INA219), 40핀 리본 1번 방향·도통 확인 후 연결.
+
+## 부팅 점검 (테스트 모드)
+
+`monitor` / `run` / `shell` 은 **시작 전에 항상 부팅 점검을 한다** (`--boot-check strict`, 기본).
+FAIL 이 하나라도 있으면 아무것도 기록·구동하지 않고 종료(코드 1)한다. `--boot-check warn` 은 보고만 하고 시작, `off` 는 생략.
+점검만 하려면 테스트 모드:
+
+```bash
+cg-collect --port /dev/serial0 --ina219 --shunt-ohm 0.1 selftest          # 표 출력, PASS/WARN → 0, FAIL → 1
+cg-collect --port /dev/serial0 selftest --json --fail-on-warn               # 전체 보고서 JSON, WARN 도 1
+cg-collect --sim ../arudino-firmware/tests/host/build/nano_host_sim selftest  # 하드웨어 없이
+```
+
+출력 형식 예시 (기본 빌드 + INA219 를 가정한 예시이며 실물에서 측정한 값이 아니다):
+
+```text
+[PASS] link            SYNC OK, PING 3.1 ms
+[PASS] firmware        0.2.0 / protocol 1.0 / PCB2-20260918-R2
+[WARN] nano_self_test  warnings: NTC_SATURATED, CAL_NOMINAL, HW_LOCKED
+[PASS] nano_status     LOCKED, locks POWER_LOCKED,ESR_LOCKED,LEAK_LOCKED,HEAT_LOCKED
+[PASS] telemetry       3 CGT in 3.0 s
+[WARN] measurement     NTC 1,2,3,4 saturated: <= ~25 degC or open (heaters stay blocked)
+[WARN] adc_path        raw -> taps agree (0 mV); NOMINAL (unmeasured) calibration
+[PASS] ina219          10 reads VALID, 0.4 mA at rest
+[PASS] clock           system clock NTP-synchronised
+[PASS] storage         28734 MB free
+BOOT CHECK: WARN
+```
+
+| 점검 | FAIL (시작 안 함) | WARN (기록하고 시작) |
+|---|---|---|
+| `link` | SYNC/PING 응답 없음 (전원, TX/RX 교차, 115200, 시리얼 콘솔) | 응답 중앙값 > 100 ms |
+| `firmware` | 프로토콜 ≠ 1.0, 하네스 맵 ≠ `--expect-map`, 실제 포트에 시뮬레이터 펌웨어 | 벤치 빌드 |
+| `nano_self_test` | Nano 자체점검(POST) 실패 비트, SELFTEST 미지원(펌웨어 < 0.2.0), 결과 없음 | 경고 비트 (0V 팩, NTC 포화, 공칭 교정, 게이트 잠김) |
+| `nano_status` | TRIPPED (원인 확인 후 RESET) | 직전 리셋이 워치독/브라운아웃, RAM 부족, 루프 지연 |
+| `telemetry` | 3 s 동안 CGT 없음, 프레임 오류 > 20% | 프레임 오류·seq 공백·CGT 부족 |
+| `measurement` | AREF/ADC 포화/탭 역전/STALE, NTC 단락·변환불가 | 팩 ≈ 0 V(빈 팩 또는 하네스 미연결), NTC 포화, 정지 중 셀 값 흔들림 > 50 mV |
+| `adc_path` | CGD raw 로 다시 계산한 탭과 CGT 탭 차이 > 30 mV | > 10 mV, 공칭 교정 |
+| `ina219` (`--ina219`) | 장치 없음/설정 레지스터 불일치/I2C 오류/범위 밖 | 모든 출력 OFF 인데 \|I\| > 10 mA (오프셋·션트 배선 H4_1·부호) |
+| `clock` | 시스템 연도 < 2025 (RTC 없는 Pi 가 NTP 전) | NTP 미동기 |
+| `storage` | 데이터 디렉터리 쓰기 불가, 여유 < 100 MB | 여유 < 1 GB, 비정상 종료로 남은 `.part` |
+
+- 보고서 `outbox/selftest-<UTC>-<n>.jsonl` (`selftest_report_v1`: 결과, 점검별 상태·근거 데이터, 펌웨어 정보, 점검 중 UART 원문)
+  → 데이터 파일과 함께 서버로 간다. 장치가 왜 시작했는지/못 했는지 서버에서 볼 수 있다.
+- Nano 쪽 자체점검 내용과 한계는 펌웨어 `docs/self_test.md`. **출력(릴레이·MOSFET·히터)은 되읽기 회로가 없어 점검하지 않는다**
+  — 점검은 아무 출력도 켜지 않는다.
+- 부팅 시 자동 시작: `examples/cellguard-collector.service` (systemd). 점검 FAIL 이면 종료 → 120 s 후 재시도, 매 시도 보고서 기록.
 
 ## 데이터 저장과 서버 전송
 

@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from .session import ACTUATION_COMMANDS, CommandTimeout, NanoSession
 
 STEP_COMMANDS = {"SYNC", "PING", "STATUS", "RAW", "CAL", "ARM", "OFF", "TRIP", "RESET", "CHARGE", "DISCHARGE",
-                 "ESR", "LEAK", "HEAT", "BENCH"}
+                 "ESR", "LEAK", "HEAT", "BENCH", "SELFTEST"}
 ARG_COUNTS = {"CHARGE": 1, "DISCHARGE": 1, "ESR": 2, "LEAK": 2, "HEAT": 2, "BENCH": 2}
 
 

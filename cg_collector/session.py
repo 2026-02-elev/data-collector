@@ -14,7 +14,7 @@ from .protocol import (Ack, CalibrationInfo, Event, FrameError, Message, Telemet
 from .transport import Transport
 
 ACTUATION_COMMANDS = {"ARM", "RESET", "CHARGE", "DISCHARGE", "ESR", "LEAK", "HEAT", "BENCH"}
-READ_ONLY_COMMANDS = {"SYNC", "PING", "STATUS", "RAW", "CAL", "OFF", "TRIP"}
+READ_ONLY_COMMANDS = {"SYNC", "PING", "STATUS", "RAW", "CAL", "OFF", "TRIP", "SELFTEST"}
 
 
 @dataclasses.dataclass
@@ -172,6 +172,10 @@ class NanoSession:
     def subscribe(self, fn: Callable[[Received], None]) -> None:
         """Every received frame (also those arriving while a command waits for its ACK)."""
         self._subscribers.append(fn)
+
+    def unsubscribe(self, fn: Callable[[Received], None]) -> None:
+        if fn in self._subscribers:
+            self._subscribers.remove(fn)
 
     def on_transmit(self, fn: Callable[[dt.datetime, str], None]) -> None:
         """Every frame sent to the Nano (for the raw log; retransmissions included)."""

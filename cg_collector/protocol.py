@@ -25,7 +25,15 @@ TRIP_NAMES = {
 TEMP_QUALITY = ("VALID", "SATURATED_OR_OPEN", "SHORT_OR_LOW", "ADC_INVALID")
 VQ_BITS = {"ADC_SATURATED": 1, "TAP_INVERSION": 2, "AREF_INVALID": 4, "STALE": 8, "PACK_NEAR_ZERO": 16}
 LOCK_BITS = {"POWER_LOCKED": 0, "ESR_LOCKED": 1, "LEAK_LOCKED": 2, "HEAT_LOCKED": 3, "MEAS_INVALID": 4,
-             "NOSYNC": 5, "TEMP_SENSOR_FAULT": 6}
+             "NOSYNC": 5, "TEMP_SENSOR_FAULT": 6, "SELF_TEST_FAILED": 7}
+# Nano power-on self test (firmware >= 0.2.0): CGE SELF_TEST, requested = fail bits, commanded = warn bits
+SELF_TEST_FAIL_BITS = {"AREF": 0, "ADC_SATURATED": 1, "TAP_INVERSION": 2, "ADC_UNSTABLE": 3, "NTC_FAULT": 4,
+                       "CALIBRATION": 5, "RESET_CAUSE": 6}
+SELF_TEST_WARN_BITS = {"PACK_NEAR_ZERO": 0, "NTC_SATURATED": 1, "CAL_NOMINAL": 2, "HW_LOCKED": 3, "SIM_OR_BENCH": 4}
+
+
+def bit_names(mask: int, table: dict) -> List[str]:
+    return [name for name, bit in table.items() if mask >> bit & 1]
 CGV_FLAG_BITS = {
     "MAP_VERIFIED": 0, "THERMAL_PROTECTION_VERIFIED": 1, "CURRENT_SENSOR_DECLARED": 2,
     "PACK_RELAY_VERIFIED": 3, "ESR_RELAY_VERIFIED": 4, "POWER_MOS_VERIFIED": 5, "R17_VERIFIED": 6,

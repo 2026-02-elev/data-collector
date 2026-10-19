@@ -10,9 +10,10 @@ import sys
 from pathlib import Path
 from typing import Iterator, Optional, Sequence
 
-from .current import CurrentSampler, Ina219
+from .current import CurrentSampler, CurrentSource, Ina219
 from .events import EventRecorder
 from .fusion import Collector, FusionContext, rfc3339_us
+from .preflight import FAIL, PASS, PreflightOptions, format_report, run_preflight, write_report
 from .replay import read_collector_log, read_ina219_log, replay, replay_generator_run
 from .runner import PlanError, Pump, RunAborted, load_plan, parse_plan, run_steps, shell_command
 from .session import CommandTimeout, NanoSession, Received
@@ -28,8 +29,32 @@ def _transport(a: argparse.Namespace) -> Transport:
     return SerialTransport(a.port, a.baud)
 
 
+def _current_source(a: argparse.Namespace):
+    """(source, error): the INA219 driver, or why it could not be opened."""
+    if not a.ina219:
+        return None, None
+    try:
+        return Ina219(bus=a.i2c_bus, address=int(a.i2c_address, 0), shunt_ohm=a.shunt_ohm, sign=a.current_sign), None
+    except Exception as exc:  # no smbus2, no /dev/i2c-1, no device at the address ...
+        return None, exc
+
+
+def boot_check(a: argparse.Namespace, session: NanoSession, source: Optional[CurrentSource],
+               error: Optional[BaseException]):
+    """Runs the boot check, stores its report in the outbox and prints a summary."""
+    opts = PreflightOptions(simulated=bool(a.sim), expect_map=a.expect_map, watch_s=a.boot_watch_s)
+    meta = {"device_id": a.device_id, "pack_id": a.pack_id, "run_id": a.run_id,
+            "port": "simulator" if a.sim else a.port, "command": a.cmd}
+    report = run_preflight(session, Path(a.data_dir), opts, current_source=source, current_error=error, meta=meta)
+    path = write_report(report, Path(a.data_dir))
+    print(format_report(report), file=sys.stderr)
+    print(f"report -> {path}", file=sys.stderr, flush=True)
+    return report
+
+
 @contextlib.contextmanager
-def collection(a: argparse.Namespace, session: NanoSession) -> Iterator[Collector]:
+def collection(a: argparse.Namespace, session: NanoSession, source: Optional[CurrentSource] = None
+               ) -> Iterator[Collector]:
     """Raw UART log (both directions) + normalized samples + fault events (+ INA219) for one run."""
     data_dir = Path(a.data_dir)
     clock = session.t.now_utc
@@ -52,8 +77,7 @@ def collection(a: argparse.Namespace, session: NanoSession) -> Iterator[Collecto
     session.on_transmit(log_tx)
     sampler: Optional[CurrentSampler] = None
     ina_log: Optional[RotatingWriter] = None
-    if a.ina219:
-        source = Ina219(bus=a.i2c_bus, address=int(a.i2c_address, 0), shunt_ohm=a.shunt_ohm, sign=a.current_sign)
+    if source is not None:
         sampler = CurrentSampler(source, period_s=0.1)
         # every INA219 read (value, sample / availability time, quality, register) as raw evidence;
         # written only from the sampler thread
@@ -174,6 +198,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--i2c-address", default="0x40")
     p.add_argument("--shunt-ohm", type=float, default=0.1, help="MEASURED shunt resistance of the module")
     p.add_argument("--current-sign", type=int, default=1, choices=[1, -1], help="-1 if installed reversed")
+    p.add_argument("--boot-check", default="strict", choices=["strict", "warn", "off"],
+                   help="boot check before monitor/run/shell: strict = do not start on FAIL (default), "
+                        "warn = report and start anyway, off = skip")
+    p.add_argument("--boot-watch-s", type=float, default=3.0, help="telemetry window of the boot check")
+    p.add_argument("--expect-map", default="PCB2-20260918-R2", help="harness map version the firmware must report")
     sub = p.add_subparsers(dest="cmd", required=True)
     mon = sub.add_parser("monitor", help="read-only collection: SYNC, CAL, heartbeat, store samples")
     mon.add_argument("--seconds", type=float, default=0, help="0 = until Ctrl-C")
@@ -184,6 +213,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sh.add_argument("--i-am-supervising", action="store_true")
     q = sub.add_parser("query", help="one read-only command (PING/STATUS/RAW/CAL)")
     q.add_argument("name", choices=[c.lower() for c in QUERY_COMMANDS] + list(QUERY_COMMANDS))
+    st = sub.add_parser("selftest", help="test mode: check link, Nano self test, sensors, INA219, clock and storage")
+    st.add_argument("--fail-on-warn", action="store_true", help="exit 1 on WARN as well")
+    st.add_argument("--json", action="store_true", help="print the full report as JSON on stdout")
     sub.add_parser("outbox", help="list closed files waiting for server upload")
     rp = sub.add_parser("replay", help="rebuild samples/events offline from a UART log")
     src = rp.add_mutually_exclusive_group(required=True)
@@ -205,7 +237,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     t = _transport(a)
     session = NanoSession(t)
     a.run_id = a.run_id or f"run-{t.now_utc().strftime('%Y%m%dT%H%M%SZ')}"
+    source, source_error = _current_source(a) if a.cmd != "query" else (None, None)
     try:
+        if a.cmd == "selftest":
+            report = boot_check(a, session, source, source_error)
+            if a.json:
+                print(json.dumps(report.to_record(), ensure_ascii=False, indent=1))
+            return 0 if report.result == PASS or (report.result != FAIL and not a.fail_on_warn) else 1
+
+        if a.cmd in ("monitor", "run", "shell"):
+            if a.boot_check != "off":
+                report = boot_check(a, session, source, source_error)
+                if report.result == FAIL and a.boot_check == "strict":
+                    print("boot check FAILED - not starting (fix the FAIL items, or --boot-check warn)",
+                          file=sys.stderr)
+                    return 1
+            if source_error is not None:
+                print(f"INA219 unavailable ({source_error}): pack current will be null", file=sys.stderr)
+
         if a.cmd == "query":
             ack = session.command(a.name.upper())
             print(f"{'OK' if ack.ok else 'ERR'} {ack.text}")
@@ -215,7 +264,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0 if ack.ok else 1
 
         if a.cmd == "monitor":
-            with collection(a, session) as col:
+            with collection(a, session, source) as col:
                 session.command("SYNC")
                 session.command("CAL")
                 try:
@@ -233,7 +282,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if a.cmd == "run":
             steps = parse_plan(load_plan(Path(a.plan)))
-            with collection(a, session) as col:
+            with collection(a, session, source) as col:
                 try:
                     results = run_steps(session, steps, supervised=a.i_am_supervising)
                     rc = 0
@@ -246,7 +295,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return rc
 
         # shell
-        with collection(a, session) as col:
+        with collection(a, session, source) as col:
             ack = session.command("SYNC")
             print(f"SYNC {'OK' if ack.ok else 'ERR'} {ack.text}")
             session.pump(1.0)  # let the first CGS arrive (the Nano may still be in SELF_TEST)

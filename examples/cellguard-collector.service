@@ -1,0 +1,27 @@
+# CellGuard data collector - start at Pi boot: boot check first, then monitoring.
+# Author: Yongho Ahn <nanhosoft@gmail.com>
+#
+# Install (adjust user, paths, device id, INA219 options):
+#   sudo cp examples/cellguard-collector.service /etc/systemd/system/
+#   sudo systemctl enable systemd-time-wait-sync.service   # really wait for NTP before starting
+#   sudo systemctl daemon-reload && sudo systemctl enable --now cellguard-collector
+#   journalctl -u cellguard-collector -f                  # boot check table + run log
+#
+# A failed boot check exits with code 1: nothing is recorded, the report goes to the
+# outbox, and systemd retries after RestartSec (e.g. the Nano was not powered yet).
+[Unit]
+Description=CellGuard data collector (boot check, then monitor)
+Wants=time-sync.target
+After=time-sync.target dev-serial0.device
+
+[Service]
+Type=simple
+User=cellguard
+ExecStart=/usr/local/bin/cg-collect --port /dev/serial0 --data-dir /var/lib/cellguard \
+          --device-id cellguard-001 --pack-id pack-01 --boot-check strict monitor
+Restart=on-failure
+RestartSec=120
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

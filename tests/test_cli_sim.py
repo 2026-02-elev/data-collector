@@ -77,7 +77,9 @@ def test_query_and_outbox(sim_path, tmp_path, capsys):
     cli.main(["--sim", sim_path, "--data-dir", str(tmp_path), "monitor", "--seconds", "2"])
     capsys.readouterr()
     assert cli.main(["--data-dir", str(tmp_path), "outbox"]) == 0
-    assert len(capsys.readouterr().out.splitlines()) == 3  # raw + samples + events
+    files = capsys.readouterr().out.splitlines()
+    assert len(files) == 4  # boot check report + raw + samples + events
+    assert any(Path(f).name.startswith("selftest-") for f in files)
 
 
 def test_replay_of_own_raw_log_reproduces_samples(sim_path, tmp_path):

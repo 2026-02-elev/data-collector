@@ -68,6 +68,7 @@ class NoCurrentSensor(CurrentSource):
 class Ina219(CurrentSource):
     REG_CONFIG = 0x00
     REG_SHUNT_VOLTAGE = 0x01
+    CONFIG = 0x399F  # 32 V range, PGA /8 (+-320 mV), 12-bit, continuous shunt + bus
 
     def __init__(self, bus: int = 1, address: int = 0x40, shunt_ohm: float = 0.1, sign: int = 1,
                  max_abs_a: float = 1.0, clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(UTC)):
@@ -79,8 +80,12 @@ class Ina219(CurrentSource):
         self.sign = 1 if sign >= 0 else -1
         self.max_abs_a = max_abs_a
         self.clock = clock
-        # 32 V range, PGA /8 (+-320 mV), 12-bit, continuous shunt + bus.
-        self._bus.write_i2c_block_data(self.address, self.REG_CONFIG, [0x39, 0x9F])
+        self._bus.write_i2c_block_data(self.address, self.REG_CONFIG, [self.CONFIG >> 8, self.CONFIG & 0xFF])
+
+    def probe(self) -> dict:
+        """Reads the configuration register back (boot check: right device, I2C really works)."""
+        hi, lo = self._bus.read_i2c_block_data(self.address, self.REG_CONFIG, 2)
+        return {"address": hex(self.address), "config_register": (hi << 8) | lo, "expected": self.CONFIG}
 
     def read(self) -> CurrentReading:
         t0 = self.clock()
