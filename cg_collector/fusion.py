@@ -128,6 +128,9 @@ class Collector:
         t_rx = self.t_of(rec.utc)
         msg = rec.message
         if msg is None:
+            if rec.unknown_type is not None:  # valid CRC, type unknown to this parser: not a transport error
+                self.counters["unknown_frames"] = self.counters.get("unknown_frames", 0) + 1
+                return
             self._since["crc" if rec.error and "CRC" in rec.error else "fmt"] += 1
             return
         if isinstance(msg, Event) and msg.code == "BOOT":
@@ -168,7 +171,8 @@ class Collector:
         self.flush()
         self.last_seq, self.last_millis = f.seq, f.millis
         self.counters["cgt_valid"] += 1
-        self.pending = {"cgt": f, "t_rx": t_rx, "epoch": self.boot_epoch, "raw_sent": not self.request_raw}
+        self.pending = {"cgt": f, "t_rx": t_rx, "epoch": self.boot_epoch, "raw_sent": not self.request_raw,
+                        "ref": self.ctx.raw_log_ref}  # the raw evidence of THIS CGT
         if stale_repeat and self.last_t is not None:
             self.pending["t_hint"] = self.last_t + self.ctx.period_s  # no new 5 Hz sample behind this CGT
 
@@ -261,13 +265,19 @@ class Collector:
         rec["fault_requested"] = req
         rec["power_requested"] = dict(power)
         rec["fault_request_last_ended"] = ended
+        # extension (measured only): RAMP / DRAIN request with its rested per-cell target, and the power
+        # path the Nano reports active (CGE *_START .. *_STOP). charge_/discharge_commanded stay the CGT
+        # bits: with 0.1.6 they are the momentary MOSFET state of a 120 ms on / 80 ms off pulse train.
+        stage, path = faults.stage_at(self.utc_of(t))
+        rec["power_stage_requested"] = stage
+        rec["power_path_reported"] = dict(path)
         rec["fault_modeled_applied"] = None    # no model for measured data
         rec["fault_physical_observed"] = None  # no physical feedback exists; never inferred
         rec.update(self._current(t, t_avail))
         rec["_sim_build"] = sim_build
         return rec
 
-    def _tail(self, rec: Record) -> Record:
+    def _tail(self, rec: Record, ref: Optional[str] = None) -> Record:
         version = self.s.version
         cal: Optional[CalibrationInfo] = self.s.calibration
         sim_build = rec.pop("_sim_build")
@@ -280,7 +290,7 @@ class Collector:
                                   "duplicates_since_last": self._since["dup"],
                                   "format_errors_since_last": self._since["fmt"]}})
         self._since = {"crc": 0, "dup": 0, "fmt": 0}
-        rec["raw_log_ref"] = self.ctx.raw_log_ref
+        rec["raw_log_ref"] = ref or self.ctx.raw_log_ref
         fault_active = bool(rec.get("esr_command_mask") or rec.get("leak_command_mask")
                             or any(rec.get("heater_pwm_command") or []))
         if sim_build:  # firmware host simulator output is never measured data
@@ -321,7 +331,7 @@ class Collector:
         rec["voltage_quality"] = f.voltage_quality_enum
         rec["voltage_quality_bits"] = f.voltage_quality
         rec["temperature_quality_mask"] = f.temp_quality_mask
-        self._write(self._tail(rec))
+        self._write(self._tail(rec, p.get("ref")))
         self.last_t = t
         self.last_cgt = f
         self.last_cgs = cgs or self.last_cgs

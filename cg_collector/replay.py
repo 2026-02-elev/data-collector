@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 from .current import CurrentReading, CurrentSampler
+from .diagnostics import DiagnosticRecorder
 from .events import EventRecorder
 from .fusion import Collector, FusionContext
 from .protocol import Ack, FrameError, decode_line
@@ -31,7 +32,8 @@ from .session import NanoSession, Received
 from .transport import Transport
 
 UTC = dt.timezone.utc
-# (utc, kind, payload): kind "N>P" / "P>N" (payload = frame text) or "INA" (payload = CurrentReading)
+# (utc, kind, payload[, ref]): kind "N>P" / "P>N" (payload = frame text) or "INA" (payload = CurrentReading);
+# an optional 4th element names the evidence (e.g. "<log file>:<line>") and becomes raw_log_ref
 Item = Tuple[dt.datetime, str, Union[str, CurrentReading]]
 Line = Tuple[dt.datetime, str, str]
 
@@ -60,7 +62,7 @@ def read_collector_log(paths: Iterable[Path]) -> Iterator[Line]:
             if not raw.strip():
                 continue
             r = json.loads(raw)
-            if r.get("dir") == "RUN":  # run header (time origin), not a frame
+            if r.get("dir") in ("RUN", "END"):  # run header (time origin) / footer (run end), not frames
                 continue
             if r.get("dir") == "P>N":
                 yield _parse_utc(r["pi_sent_utc"]), "P>N", r["frame"]
@@ -94,7 +96,8 @@ class _ClockTransport(Transport):
 def replay(lines: Iterable[Line], ctx: FusionContext, sample_sink: Callable[[dict], None],
            event_sink: Optional[Callable[[dict], None]] = None, run_start: Optional[dt.datetime] = None,
            end_utc: Optional[dt.datetime] = None,
-           ina219: Optional[Iterable[Tuple[dt.datetime, str, CurrentReading]]] = None) -> Collector:
+           ina219: Optional[Iterable[Tuple[dt.datetime, str, CurrentReading]]] = None,
+           diag_sink: Optional[Callable[[dict], None]] = None) -> Collector:
     """Streams ``lines`` (time ordered) and optional INA219 readings through a Collector.
 
     Without ``ina219`` the records say INA219_UNAVAILABLE (as a live run without
@@ -114,6 +117,8 @@ def replay(lines: Iterable[Line], ctx: FusionContext, sample_sink: Callable[[dic
     col = Collector(s, ctx, sample_sink, current=sampler, request_raw=True, run_start_utc=start)
     if event_sink is not None:
         EventRecorder(s, col, event_sink)
+    if diag_sink is not None:
+        DiagnosticRecorder(s, col, diag_sink)
     sent: Dict[int, Tuple[str, List[int], dt.datetime]] = {}
 
     def match_ack(rec: Received) -> None:
@@ -129,7 +134,9 @@ def replay(lines: Iterable[Line], ctx: FusionContext, sample_sink: Callable[[dic
     s.subscribe(match_ack)
     item: Optional[Item] = first
     while item is not None:
-        utc, kind, payload = item
+        utc, kind, payload = item[0], item[1], item[2]
+        if len(item) > 3:
+            ctx.raw_log_ref = item[3]  # type: ignore[misc]
         t.now = utc
         if kind == "INA":
             sampler.feed(payload)  # type: ignore[union-attr,arg-type]

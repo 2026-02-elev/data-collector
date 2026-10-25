@@ -9,11 +9,12 @@ import datetime as dt
 import threading
 from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
-from .protocol import (Ack, CalibrationInfo, Event, FrameError, Message, Telemetry, Version, TRIP_NAMES,
-                       decode_line, encode_frame, parse_message)
+from .firmware import Capabilities, UnsupportedCommand, capabilities
+from .protocol import (Ack, CalibrationInfo, Event, FrameError, Message, Telemetry, UnknownFrameType, Version,
+                       TRIP_NAMES, decode_line, encode_frame, parse_message)
 from .transport import Transport
 
-ACTUATION_COMMANDS = {"ARM", "RESET", "CHARGE", "DISCHARGE", "ESR", "LEAK", "HEAT", "BENCH"}
+ACTUATION_COMMANDS = {"ARM", "RESET", "CHARGE", "DISCHARGE", "ESR", "LEAK", "HEAT", "BENCH", "RAMP", "DRAIN"}
 READ_ONLY_COMMANDS = {"SYNC", "PING", "STATUS", "RAW", "CAL", "OFF", "TRIP", "SELFTEST"}
 
 
@@ -23,6 +24,7 @@ class Received:
     raw: str
     message: Optional[Message]
     error: Optional[str] = None
+    unknown_type: Optional[str] = None   # CRC-valid frame of a type the parser does not know (not an error)
 
 
 class CommandTimeout(RuntimeError):
@@ -45,12 +47,16 @@ class FaultTracker:
       always reported as unverified (null).
     """
 
-    STOP_EVENTS = {"CHARGE_STOP": "CHARGE", "DISCHARGE_STOP": "DISCHARGE", "ESR_STOP": "ESR",
-                   "LEAK_STOP": "LEAK", "HEAT_STOP": "HEAT"}
+    STOP_EVENTS = {"CHARGE_STOP": "CHARGE", "DISCHARGE_STOP": "DISCHARGE", "DRAIN_STOP": "DISCHARGE",
+                   "ESR_STOP": "ESR", "LEAK_STOP": "LEAK", "HEAT_STOP": "HEAT"}
+    # power path the Nano REPORTS active (CGE start .. stop), independent of the momentary MOS state in CGT
+    PATH_START = {"CHARGE_START": "charge", "DISCHARGE_START": "discharge", "DRAIN_START": "discharge"}
+    PATH_STOP = {"CHARGE_STOP": "charge", "DISCHARGE_STOP": "discharge", "DRAIN_STOP": "discharge"}
 
     def __init__(self) -> None:
         self.requested: Dict[Tuple[str, int], Dict[str, object]] = {}
         self.last_ended: Optional[Dict[str, object]] = None
+        self.path_reported = {"charge": False, "discharge": False}
         # Maps a CGE to the time the Nano acted (set by the Collector once it knows the
         # Nano clock offset); defaults to the Pi receive time.
         self.event_clock: Callable[[Event, dt.datetime], dt.datetime] = lambda ev, rx_utc: rx_utc
@@ -63,14 +69,22 @@ class FaultTracker:
         if self._hist_t and utc < self._hist_t[-1]:
             utc = self._hist_t[-1]  # keep the history monotonic
         self._hist_t.append(utc)
-        self._hist_v.append((self.requested_struct(), self.power_requested(), self.last_ended))
+        self._hist_v.append((self.requested_struct(), self.power_requested(), self.last_ended,
+                             self.power_stage_requested(), dict(self.path_reported)))
+
+    def _at(self, utc: dt.datetime) -> tuple:
+        i = bisect.bisect_right(list(self._hist_t), utc)
+        if i == 0:
+            return None, {"charge": False, "discharge": False}, None, None, {"charge": False, "discharge": False}
+        return self._hist_v[i - 1]
 
     def state_at(self, utc: dt.datetime) -> tuple:
         """(fault_requested, power_requested, fault_request_last_ended) as of ``utc``."""
-        i = bisect.bisect_right(list(self._hist_t), utc)
-        if i == 0:
-            return None, {"charge": False, "discharge": False}, None
-        return self._hist_v[i - 1]
+        return self._at(utc)[:3]
+
+    def stage_at(self, utc: dt.datetime) -> tuple:
+        """(power_stage_requested, power_path_reported) as of ``utc``."""
+        return self._at(utc)[3:]
 
     def _end(self, key: Tuple[str, int], reason: str, utc: dt.datetime, since: Optional[str] = None) -> None:
         req = self.requested.pop(key, None)
@@ -86,6 +100,8 @@ class FaultTracker:
     def _key_value(name: str, args: Sequence[int]) -> Optional[Tuple[Tuple[str, int], int]]:
         if name in ("CHARGE", "DISCHARGE"):
             return (name, 0), int(args[0])
+        if name in ("RAMP", "DRAIN"):  # staged charge / discharge to a rested per-cell target (0.1.6)
+            return ("CHARGE" if name == "RAMP" else "DISCHARGE", 0), int(args[0])
         if name in ("ESR", "LEAK", "HEAT"):
             return (name, int(args[0])), int(args[1])
         return None
@@ -98,7 +114,8 @@ class FaultTracker:
             if kv is not None and kv[1]:  # requested from sending until the refusal arrived
                 key, value = kv
                 prev = self.requested.get(key)
-                self.requested[key] = {"value": value, "since_utc": prev["since_utc"] if prev else _iso(utc)}
+                self.requested[key] = {"value": value, "since_utc": prev["since_utc"] if prev else _iso(utc),
+                                       "command": name}
                 self._snap(utc)
                 self._end(key, "REJECTED_" + ack.text, ack_utc or utc)
                 self._snap(ack_utc or utc)
@@ -110,7 +127,8 @@ class FaultTracker:
         else:
             key, value = kv
             if value:
-                self.requested.setdefault(key, {"value": value, "since_utc": _iso(utc)})["value"] = value
+                entry = self.requested.setdefault(key, {"value": value, "since_utc": _iso(utc)})
+                entry.update(value=value, command=name)
             else:
                 self._end(key, "HOST", utc)
         self._snap(utc)
@@ -118,8 +136,13 @@ class FaultTracker:
     def on_event(self, ev: Event, utc: dt.datetime) -> None:
         if ev.code == "BOOT":  # a Nano reset switched every output off
             self._end_all("NANO_RESET", utc)
+            self.path_reported = {"charge": False, "discharge": False}
             self._snap(utc)
             return
+        path = self.PATH_START.get(ev.code) or self.PATH_STOP.get(ev.code)
+        if path is not None:
+            self.path_reported[path] = ev.code in self.PATH_START
+            self._snap(self.event_clock(ev, utc))
         kind = self.STOP_EVENTS.get(ev.code)
         if kind is not None and ev.reason != "HOST":
             at = self.event_clock(ev, utc)
@@ -137,6 +160,17 @@ class FaultTracker:
 
     def power_requested(self) -> Dict[str, bool]:
         return {"charge": ("CHARGE", 0) in self.requested, "discharge": ("DISCHARGE", 0) in self.requested}
+
+    def power_stage_requested(self) -> Optional[Dict[str, object]]:
+        """The open power request with its command (RAMP / DRAIN carry a rested per-cell target)."""
+        for key in (("CHARGE", 0), ("DISCHARGE", 0)):
+            req = self.requested.get(key)
+            if req is not None:
+                cmd = req.get("command", key[0])
+                staged = cmd in ("RAMP", "DRAIN")
+                return {"command": cmd, "direction": key[0],
+                        "target_mv_per_cell": req["value"] if staged else None, "since_utc": req["since_utc"]}
+        return None
 
 
 def _iso(t: dt.datetime) -> str:
@@ -168,6 +202,12 @@ class NanoSession:
         self._cmd_listeners: List[Callable[[str, Sequence[int], Ack, dt.datetime], None]] = []
         self._idle_hooks: List[Callable[["NanoSession"], None]] = []
         self._lock = threading.RLock()
+        self.unknown_frames = 0
+
+    @property
+    def capabilities(self) -> Capabilities:
+        """What the connected firmware supports (from its CGV; read-only until one was seen)."""
+        return capabilities(self.version)
 
     def subscribe(self, fn: Callable[[Received], None]) -> None:
         """Every received frame (also those arriving while a command waits for its ACK)."""
@@ -203,6 +243,9 @@ class NanoSession:
             utc = self.t.now_utc()
             try:
                 rec = Received(utc, line, parse_message(decode_line(line)))
+            except UnknownFrameType as exc:
+                self.unknown_frames += 1  # CRC was valid: kept as raw evidence, not counted as an error
+                rec = Received(utc, line, None, None, unknown_type=exc.kind)
             except FrameError as exc:
                 self.frame_errors += 1
                 rec = Received(utc, line, None, str(exc))
@@ -225,7 +268,12 @@ class NanoSession:
 
     # -- command side --
     def command(self, name: str, *args: int) -> Ack:
-        """Sends one command; on timeout re-sends the SAME seq (the Nano de-duplicates)."""
+        """Sends one command; on timeout re-sends the SAME seq (the Nano de-duplicates).
+
+        Raises UnsupportedCommand (and sends nothing) when the detected firmware does not
+        support the command - e.g. SELFTEST or CHARGE,1 on 0.1.6-LOAD-VERIFY.
+        """
+        self.capabilities.check(name, args)
         with self._lock:
             self.seq = (self.seq + 1) & 0xFFFF
             seq = self.seq
@@ -274,4 +322,4 @@ def trip_name(code: int) -> str:
 
 
 __all__ = ["ACTUATION_COMMANDS", "READ_ONLY_COMMANDS", "CommandTimeout", "FaultTracker", "NanoSession",
-           "Received", "Telemetry", "trip_name"]
+           "Received", "Telemetry", "UnsupportedCommand", "trip_name"]

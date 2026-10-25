@@ -21,6 +21,8 @@ TRIP_NAMES = {
     5: "ADC_SATURATED", 6: "TAP_INVERSION", 7: "AREF_INVALID", 8: "HOST_TRIP",
     9: "WATCHDOG_RESET", 10: "BROWNOUT_RESET", 11: "STALE_SAMPLE", 12: "INTERNAL",
     13: "CHARGE_NO_RESPONSE", 14: "TAP_STEP", 15: "TEMP_SENSOR_FAULT",
+    # 0.1.6-LOAD-VERIFY only
+    16: "CELL_IMBALANCE", 17: "DISCHARGE_NO_RESPONSE",
 }
 TEMP_QUALITY = ("VALID", "SATURATED_OR_OPEN", "SHORT_OR_LOW", "ADC_INVALID")
 VQ_BITS = {"ADC_SATURATED": 1, "TAP_INVERSION": 2, "AREF_INVALID": 4, "STALE": 8, "PACK_NEAR_ZERO": 16}
@@ -65,6 +67,14 @@ def encode_frame(payload: str) -> bytes:
 
 class FrameError(ValueError):
     pass
+
+
+class UnknownFrameType(FrameError):
+    """CRC-valid frame of a type this parser does not know: not a transport error."""
+
+    def __init__(self, kind: str):
+        super().__init__(f"unknown frame type {kind!r}")
+        self.kind = kind
 
 
 def decode_line(line: Union[str, bytes]) -> str:
@@ -199,8 +209,41 @@ class CalibrationInfo:
     ntc_r25: int
 
 
-Message = Union[Ack, Telemetry, Status, RawAdc, Event, Version, CalibrationInfo]
-FIELD_COUNTS = {"CGA": 4, "CGT": 23, "CGS": 17, "CGD": 10, "CGE": 8, "CGV": 5, "CGK": 16}
+@dataclasses.dataclass
+class LoadTapSuspect:
+    """CGY (0.1.6-LOAD-VERIFY): taps measured WITH the charge/drain MOSFET ON that looked inverted.
+
+    On-load diagnostic only. It is NOT a stored (rested) cell voltage and must never be
+    used as one; the Nano switched the MOSFET off and re-checks on the next rested sample.
+    """
+    millis: int
+    direction: int           # 1 = charge (RAMP), 2 = discharge (DRAIN)
+    raw: List[int]           # A0..A3 under load
+    tap_mv: List[int]        # cumulative taps under load (firmware conversion)
+    bandgap_raw: int
+
+    @property
+    def direction_name(self) -> str:
+        return {1: "CHARGE", 2: "DISCHARGE"}.get(self.direction, str(self.direction))
+
+
+@dataclasses.dataclass
+class TripSnapshot:
+    """CGX (0.1.6-LOAD-VERIFY): the measurement that caused a latched trip (sent before the TRIP CGE)."""
+    millis: int
+    trip: int
+    raw: List[int]           # A0..A3
+    tap_mv: List[int]
+    bandgap_raw: int
+    voltage_quality: int
+
+    @property
+    def voltage_quality_flags(self) -> List[str]:
+        return [name for name, bit in VQ_BITS.items() if self.voltage_quality & bit]
+
+
+Message = Union[Ack, Telemetry, Status, RawAdc, Event, Version, CalibrationInfo, LoadTapSuspect, TripSnapshot]
+FIELD_COUNTS = {"CGA": 4, "CGT": 23, "CGS": 17, "CGD": 10, "CGE": 8, "CGV": 5, "CGK": 16, "CGY": 12, "CGX": 13}
 
 
 def _int(text: str) -> int:
@@ -217,7 +260,7 @@ def parse_message(payload: str) -> Message:
     f = payload.split(",")
     kind = f[0]
     if kind not in FIELD_COUNTS:
-        raise FrameError(f"unknown frame type {kind!r}")
+        raise UnknownFrameType(kind)
     if len(f) != FIELD_COUNTS[kind]:
         raise FrameError(f"{kind} expects {FIELD_COUNTS[kind]} fields, got {len(f)}")
     if kind == "CGA":
@@ -243,5 +286,11 @@ def parse_message(payload: str) -> Message:
         return Event(_int(f[1]), _int(f[2]), f[3], _int(f[4]), _int(f[5]), _int(f[6]), f[7])
     if kind == "CGV":
         return Version(f[1], f[2], f[3], _int(f[4]))
+    if kind == "CGY":
+        n = [_int(x) for x in f[1:]]
+        return LoadTapSuspect(n[0], n[1], n[2:6], n[6:10], n[10])
+    if kind == "CGX":
+        n = [_int(x) for x in f[1:]]
+        return TripSnapshot(n[0], n[1], n[2:6], n[6:10], n[10], n[11])
     return CalibrationInfo(_int(f[1]), f[2], f[3], _int(f[4]), _int(f[5]), [_int(x) for x in f[6:10]],
                            [_int(x) for x in f[10:14]], _int(f[14]), _int(f[15]))

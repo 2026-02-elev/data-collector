@@ -11,12 +11,15 @@ from pathlib import Path
 from typing import Iterator, Optional, Sequence
 
 from .current import CurrentSampler, CurrentSource, Ina219
+from .cycle import CycleAborted, CycleRunner, validate_targets
+from .cyclelog import import_cycle_log
+from .diagnostics import DiagnosticRecorder
 from .events import EventRecorder
 from .fusion import Collector, FusionContext, rfc3339_us
 from .preflight import FAIL, PASS, PreflightOptions, format_report, run_preflight, write_report
 from .replay import read_collector_log, read_ina219_log, replay, replay_generator_run
 from .runner import PlanError, Pump, RunAborted, load_plan, parse_plan, run_steps, shell_command
-from .session import CommandTimeout, NanoSession, Received
+from .session import CommandTimeout, NanoSession, Received, UnsupportedCommand
 from .storage import Outbox, RotatingWriter
 from .transport import SerialTransport, SimTransport, Transport
 
@@ -62,6 +65,7 @@ def collection(a: argparse.Namespace, session: NanoSession, source: Optional[Cur
     raw = RotatingWriter(data_dir, "raw", **kw)
     samples = RotatingWriter(data_dir, "samples", **kw)
     events = RotatingWriter(data_dir, "events", **kw)
+    diagnostics = RotatingWriter(data_dir, "diagnostics", **kw)
     run_start = clock()
     # first raw record: the run's time origin (t_sim_s = 0), so a replay reproduces t_sim_s
     raw.write_record({"dir": "RUN", "run_start_utc": rfc3339_us(run_start), "run_id": a.run_id,
@@ -97,18 +101,24 @@ def collection(a: argparse.Namespace, session: NanoSession, source: Optional[Cur
     def write_event(rec: dict) -> None:
         events.write_record(rec)
 
+    # raw_log_ref always names the raw file being written at that moment (subscribed before the
+    # collector, so a CGT's record names the file holding that CGT)
+    session.subscribe(lambda _r: setattr(ctx, "raw_log_ref", raw.current_name or "raw-log-unset"))
     collector = Collector(session, ctx, write_sample, current=sampler, request_raw=not a.no_raw,
                           run_start_utc=run_start)
     EventRecorder(session, collector, write_event)
-    # raw_log_ref always names the raw file being written at that moment
-    session.subscribe(lambda _r: setattr(ctx, "raw_log_ref", raw.current_name or "raw-log-unset"))
+    # CGY / CGX and 0.1.6 diagnostic events: never samples, never fault events
+    collector.diagnostics = DiagnosticRecorder(session, collector, diagnostics.write_record)  # type: ignore[attr-defined]
     try:
         yield collector
     finally:
-        collector.close()
+        end = clock()
+        collector.close(collector.t_of(end))
+        # last raw record: where the run ended, so a replay writes the same trailing (missing) slots
+        raw.write_record({"dir": "END", "run_end_utc": rfc3339_us(end)})
         if sampler:
             sampler.stop()
-        for w in (raw, samples, events, ina_log):
+        for w in (raw, samples, events, diagnostics, ina_log):
             if w is not None:
                 w.close()
 
@@ -120,8 +130,10 @@ def _replay(a: argparse.Namespace) -> int:
                         scenario_id=a.scenario_id)
     fs = open(out / "samples.jsonl", "w", encoding="utf-8")
     fe = open(out / "events.jsonl", "w", encoding="utf-8")
+    fd = open(out / "diagnostics.jsonl", "w", encoding="utf-8")
     sample_sink = lambda r: fs.write(json.dumps(r, separators=(",", ":")) + "\n")  # noqa: E731
     event_sink = lambda r: fe.write(json.dumps(r, separators=(",", ":")) + "\n")  # noqa: E731
+    diag_sink = lambda r: fd.write(json.dumps(r, separators=(",", ":")) + "\n")  # noqa: E731
     try:
         if a.from_generator:
             run = Path(a.from_generator)
@@ -147,12 +159,30 @@ def _replay(a: argparse.Namespace) -> int:
                 ctx.scenario_id = header.get("scenario_id", ctx.scenario_id)
             ctx.raw_log_ref = ",".join(p.name for p in raws)
             col = replay(read_collector_log(raws), ctx, sample_sink, event_sink, run_start=start,
-                         ina219=read_ina219_log(inas) if inas else None)
+                         end_utc=_run_footer(raws[-1]),
+                         ina219=read_ina219_log(inas) if inas else None, diag_sink=diag_sink)
     finally:
         fs.close()
         fe.close()
+        fd.close()
     print(json.dumps(col.counters), file=sys.stderr)
     return 0
+
+
+def _run_footer(path: Path) -> Optional[dt.datetime]:
+    """End of the run from the raw log's END record (None for logs written before it existed)."""
+    last = None
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                last = line
+    try:
+        r = json.loads(last) if last else {}
+    except ValueError:
+        return None
+    if r.get("dir") != "END":
+        return None
+    return dt.datetime.fromisoformat(r["run_end_utc"].replace("Z", "+00:00"))
 
 
 def _run_header(path: Path):
@@ -216,6 +246,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     st = sub.add_parser("selftest", help="test mode: check link, Nano self test, sensors, INA219, clock and storage")
     st.add_argument("--fail-on-warn", action="store_true", help="exit 1 on WARN as well")
     st.add_argument("--json", action="store_true", help="print the full report as JSON on stdout")
+    cy = sub.add_parser("cycle", help="supervised staged charge (RAMP) / discharge (DRAIN) cycle while collecting "
+                                      "(firmware 0.1.6-LOAD-VERIFY); targets are RESTED mV PER CELL")
+    cy.add_argument("--charge-to", type=int, required=True, metavar="MV_PER_CELL")
+    cy.add_argument("--discharge-to", type=int, metavar="MV_PER_CELL")
+    cy.add_argument("--step", type=int, default=100, metavar="MV")
+    cy.add_argument("--i-am-supervising", action="store_true")
+    im = sub.add_parser("import-cycle-log", help="convert cellguard_cycle_*.log serial traces to samples/events/"
+                                                 "diagnostics (no device needed)")
+    im.add_argument("logs", nargs="+")
+    im.add_argument("--out", required=True)
+    im.add_argument("--log-tz", default="local", help="time zone of the trace's timestamps, e.g. Asia/Seoul")
     sub.add_parser("outbox", help="list closed files waiting for server upload")
     rp = sub.add_parser("replay", help="rebuild samples/events offline from a UART log")
     src = rp.add_mutually_exclusive_group(required=True)
@@ -228,6 +269,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if a.cmd == "replay":
         return _replay(a)
+
+    if a.cmd == "import-cycle-log":
+        ctx = FusionContext(device_id=a.device_id, pack_id=a.pack_id,
+                            run_id=a.run_id or "import-" + Path(a.logs[0]).stem, scenario_id=a.scenario_id)
+        try:
+            rep = import_cycle_log([Path(x) for x in a.logs], Path(a.out), ctx, a.log_tz)
+        except ValueError as exc:
+            print(f"import failed: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({k: rep[k] for k in ("lines", "rx", "tx", "crc_or_format_errors", "unknown_types",
+                                               "firmware_versions", "records")}, ensure_ascii=False))
+        return 0
+
+    if a.cmd == "cycle":
+        try:
+            validate_targets(a.charge_to, a.discharge_to, a.step)
+        except ValueError as exc:
+            p.error(str(exc))
+        if not a.i_am_supervising:
+            print("refused: cycle energises the rig - run it only with a person watching (--i-am-supervising)",
+                  file=sys.stderr)
+            return 2
 
     if a.cmd == "outbox":
         for path in Outbox(Path(a.data_dir)).ready():
@@ -244,6 +307,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if a.json:
                 print(json.dumps(report.to_record(), ensure_ascii=False, indent=1))
             return 0 if report.result == PASS or (report.result != FAIL and not a.fail_on_warn) else 1
+
+        if a.cmd == "cycle":
+            # always checked before energising, whatever --boot-check says; conservative go / no-go
+            report = boot_check(a, session, source, source_error)
+            if not report.actuation["allowed"]:
+                print("cycle refused - nothing energised: " + "; ".join(report.actuation["reasons"]),
+                      file=sys.stderr)
+                return 1
+            with collection(a, session, source) as col:
+                runner = CycleRunner(session, col.diagnostics, log=lambda m: print(m, flush=True))
+                try:
+                    session.command("SYNC")  # every output off, fresh sequence
+                    session.command("CAL")
+                    runner.run(a.charge_to, a.discharge_to, a.step)
+                    rc = 0
+                except (CycleAborted, CommandTimeout, UnsupportedCommand) as exc:
+                    print(f"ABORTED: {exc}", file=sys.stderr)
+                    rc = 1
+                except KeyboardInterrupt:
+                    print("Interrupted. Nano has been sent OFF.", file=sys.stderr)
+                    rc = 130
+                print(f"{col.count} samples -> {a.data_dir}", file=sys.stderr)
+            return rc
 
         if a.cmd in ("monitor", "run", "shell"):
             if a.boot_check != "off":
@@ -286,7 +372,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 try:
                     results = run_steps(session, steps, supervised=a.i_am_supervising)
                     rc = 0
-                except (RunAborted, CommandTimeout, KeyboardInterrupt) as exc:
+                except (RunAborted, CommandTimeout, UnsupportedCommand, KeyboardInterrupt) as exc:
                     print(f"run aborted: {exc}", file=sys.stderr)
                     results, rc = [], 1
                 for r in results:

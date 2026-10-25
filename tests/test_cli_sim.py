@@ -18,7 +18,8 @@ def test_monitor_writes_raw_and_samples(sim_path, tmp_path, normalized_schema):
     assert cli.main(["--sim", sim_path, "--data-dir", str(tmp_path), "--run-id", "m1", "monitor", "--seconds", "5"]) == 0
     samples, raw = rows(tmp_path, "samples"), rows(tmp_path, "raw")
     assert raw[0]["dir"] == "RUN" and raw[0]["run_id"] == "m1"  # time origin for replays
-    raw = raw[1:]
+    assert raw[-1]["dir"] == "END" and raw[-1]["run_end_utc"]   # run end, so replays close the same way
+    raw = raw[1:-1]
     assert len(samples) >= 4 and raw
     for r in samples:
         jsonschema.validate(r, normalized_schema)

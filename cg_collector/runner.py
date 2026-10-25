@@ -16,7 +16,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from .session import ACTUATION_COMMANDS, CommandTimeout, NanoSession
+from .session import ACTUATION_COMMANDS, CommandTimeout, NanoSession, UnsupportedCommand
 
 STEP_COMMANDS = {"SYNC", "PING", "STATUS", "RAW", "CAL", "ARM", "OFF", "TRIP", "RESET", "CHARGE", "DISCHARGE",
                  "ESR", "LEAK", "HEAT", "BENCH", "SELFTEST"}
@@ -145,5 +145,8 @@ def shell_command(session: NanoSession, line: str, supervised: bool) -> str:
         return f"{name} expects {ARG_COUNTS.get(name, 0)} args"
     if name in ACTUATION_COMMANDS and not supervised:
         return "refused: start the shell with --i-am-supervising for actuation"
-    ack = session.command(name, *args)
+    try:
+        ack = session.command(name, *args)
+    except UnsupportedCommand as exc:  # not sent: e.g. CHARGE 1 / SELFTEST on 0.1.6-LOAD-VERIFY
+        return f"refused: {exc}"
     return f"{'OK' if ack.ok else 'ERR'} {ack.text}"

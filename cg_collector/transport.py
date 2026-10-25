@@ -23,6 +23,10 @@ class Transport:
     def now_utc(self) -> dt.datetime:
         return dt.datetime.now(UTC)
 
+    def monotonic(self) -> float:
+        """Seconds on a clock that never jumps (deadlines, timeouts)."""
+        return time.monotonic()
+
     def close(self) -> None:
         pass
 
@@ -110,6 +114,9 @@ class SimTransport(Transport):
 
     def now_utc(self) -> dt.datetime:
         return self.EPOCH + dt.timedelta(milliseconds=self.sim_ms)
+
+    def monotonic(self) -> float:
+        return self.sim_ms / 1000.0
 
     def close(self) -> None:
         if self._proc.poll() is None:

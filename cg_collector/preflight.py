@@ -15,7 +15,9 @@
 ``storage``         data directory writable, enough free space, crash leftovers
 ==================  ===========================================================
 
-Each check is PASS / WARN / FAIL / SKIP; the result is the worst of them. The
+Each check is PASS / WARN / FAIL / SKIP / UNSUPPORTED; the result is the worst of them
+(UNSUPPORTED - the connected firmware has no such check, e.g. SELFTEST on
+0.1.6-LOAD-VERIFY - counts like WARN: never reported as PASS). The
 report (``selftest_report_v1``) is written to the outbox like any data file, so
 the server sees why a device did or did not start.
 
@@ -42,8 +44,10 @@ from .protocol import (CalibrationInfo, Event, RawAdc, SELF_TEST_FAIL_BITS, SELF
                        TRIP_NAMES, bit_names)
 from .session import CommandTimeout, NanoSession, Received
 
-PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
-_RANK = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
+PASS, WARN, FAIL, SKIP, UNSUPPORTED = "PASS", "WARN", "FAIL", "SKIP", "UNSUPPORTED"
+_RANK = {PASS: 0, SKIP: 0, WARN: 1, UNSUPPORTED: 1, FAIL: 2}
+# Pi-side checks that must hold when the Nano itself has no self test (0.1.x)
+COMPENSATING = ("nano_status", "telemetry", "measurement", "adc_path")
 UTC = dt.timezone.utc
 TAP_DIVIDER = (47000 + 43000) / 43000
 VQ_FAIL = ("AREF_INVALID", "ADC_SATURATED", "TAP_INVERSION", "STALE")
@@ -93,8 +97,28 @@ class Report:
     def check(self, name: str) -> Check:
         return next(c for c in self.checks if c.name == name)
 
+    @property
+    def actuation(self) -> Dict[str, object]:
+        """Conservative go / no-go for energising outputs (cycle / run). Read-only monitoring
+        only needs ``result != FAIL``."""
+        reasons = []
+        if self.result == FAIL:
+            reasons.append("boot check FAIL")
+        fam = (self.meta.get("capabilities") or {}).get("family", "unknown")
+        if fam == "unknown":
+            reasons.append("unknown firmware: no actuation")
+        names = {c.name: c for c in self.checks}
+        st = names.get("nano_self_test")
+        if st is not None and st.status == UNSUPPORTED:
+            bad = [n for n in COMPENSATING if n not in names or names[n].status not in (PASS, WARN)]
+            if bad:
+                reasons.append("Nano has no self test and these Pi checks did not pass: " + ", ".join(bad))
+        elif st is None or st.status not in (PASS, WARN):
+            reasons.append("Nano self test did not pass")
+        return {"allowed": not reasons, "reasons": reasons}
+
     def to_record(self) -> Dict[str, object]:
-        return {"schema_version": "selftest_report_v1", "result": self.result,
+        return {"schema_version": "selftest_report_v1", "result": self.result, "actuation": self.actuation,
                 "started_utc": _iso(self.started_utc), "finished_utc": _iso(self.finished_utc),
                 "collector_version": __version__, **self.meta,
                 "checks": [dataclasses.asdict(c) for c in self.checks], "transcript": self.transcript}
@@ -184,10 +208,12 @@ def _check_firmware(session: NanoSession, o: PreflightOptions) -> Check:
     v = session.version
     if v is None:
         return Check("firmware", FAIL, "no CGV version frame after SYNC")
+    caps = session.capabilities
     from .protocol import CGV_FLAG_BITS
 
     flags = [n for n in CGV_FLAG_BITS if v.flag(n)]
-    data = {"firmware": v.firmware, "protocol": v.protocol, "map_version": v.map_version, "flags": flags}
+    data = {"firmware": v.firmware, "protocol": v.protocol, "map_version": v.map_version, "flags": flags,
+            "family": caps.family, "self_test": caps.self_test, "staged_power": caps.staged_power}
     problems, notes = [], []
     if v.protocol != o.expect_protocol:
         problems.append(f"protocol {v.protocol} (expected {o.expect_protocol})")
@@ -201,6 +227,10 @@ def _check_firmware(session: NanoSession, o: PreflightOptions) -> Check:
         return Check("firmware", FAIL, "; ".join(problems), data)
     if v.flag("BENCH_BUILD"):
         notes.append("bench build (BENCH single-output command enabled)")
+    if not caps.known:
+        notes.append(f"unknown firmware {v.firmware!r}: read-only commands only, no actuation")
+    elif caps.staged_power:
+        notes.append("commissioning build: RAMP/DRAIN only (CHARGE,1/DISCHARGE,1 refused), no SELFTEST")
     unlocked = [n for n in ("POWER_UNLOCKED", "ESR_UNLOCKED", "LEAK_UNLOCKED", "HEAT_UNLOCKED") if v.flag(n)]
     data["unlocked"] = unlocked
     text = f"{v.firmware} / protocol {v.protocol} / {v.map_version}" + (" (SIMULATED DEVICE)" if o.simulated else "")
@@ -208,6 +238,13 @@ def _check_firmware(session: NanoSession, o: PreflightOptions) -> Check:
 
 
 def _check_nano_self_test(session: NanoSession, w: _Watch, o: PreflightOptions) -> Check:
+    caps = session.capabilities
+    if not caps.self_test:
+        # not sent: this firmware has no SELFTEST (sending it would only be refused); the Pi-side
+        # checks below (status, telemetry, measurement, ADC path) have to stand in for it
+        return Check("nano_self_test", UNSUPPORTED,
+                     f"firmware {caps.firmware or 'unknown'} has no power-on self test / SELFTEST "
+                     "(Pi-side checks only)", {"family": caps.family})
     mark = len(w.frames)
     try:
         ack = session.command("SELFTEST")
@@ -470,7 +507,10 @@ def run_preflight(session: NanoSession, data_dir: Path, opts: Optional[Preflight
         w.close()
     v = session.version
     info = dict(meta or {})
+    caps = session.capabilities
     info.update({"simulated": o.simulated,
+                 "capabilities": {"family": caps.family, "self_test": caps.self_test,
+                                  "staged_power": caps.staged_power, "diagnostic_frames": caps.diagnostic_frames},
                  "firmware": None if v is None else {"version": v.firmware, "protocol": v.protocol,
                                                       "map_version": v.map_version, "flags": v.flags}})
     return Report(checks, started, session.t.now_utc(), info, w.transcript)
@@ -497,8 +537,10 @@ def write_report(report: Report, data_dir: Path) -> Path:
 def format_report(report: Report) -> str:
     lines = [f"[{c.status}] {c.name:<15} {c.detail}" for c in report.checks]
     lines.append(f"BOOT CHECK: {report.result}")
+    act = report.actuation
+    lines.append("actuation: " + ("allowed" if act["allowed"] else "NOT allowed - " + "; ".join(act["reasons"])))
     return "\n".join(lines)
 
 
-__all__ = ["Check", "FAIL", "PASS", "PreflightOptions", "Report", "SKIP", "WARN", "format_report",
+__all__ = ["Check", "FAIL", "PASS", "PreflightOptions", "Report", "SKIP", "UNSUPPORTED", "WARN", "format_report",
            "ntp_synchronized", "run_preflight", "tap_mv_from_raw", "write_report"]

@@ -21,14 +21,17 @@ from __future__ import annotations
 import datetime as dt
 from typing import Callable, Dict, Optional, Sequence
 
+from .diagnostics import classify_stop
 from .fusion import Collector, rfc3339
-from .protocol import Ack, Event
+from .protocol import Ack, Event, TripSnapshot, TRIP_NAMES
 from .session import NanoSession, Received
 
 CELL_CODES = ("ESR_START", "LEAK_START", "HEAT_START", "HEAT_SET", "ESR_STOP", "LEAK_STOP", "HEAT_STOP")
-SYSTEM_CODES = ("CHARGE_START", "CHARGE_STOP", "DISCHARGE_START", "DISCHARGE_STOP", "RELAY_ON", "RELAY_OFF",
-                "ARM", "DISARM")
-REJECT_TRACKED = ("ESR", "LEAK", "HEAT", "CHARGE", "DISCHARGE", "ARM")
+# DRAIN_START / DRAIN_STOP: the 0.1.6-LOAD-VERIFY names of the discharge path events
+SYSTEM_CODES = ("CHARGE_START", "CHARGE_STOP", "DISCHARGE_START", "DISCHARGE_STOP", "DRAIN_START", "DRAIN_STOP",
+                "RELAY_ON", "RELAY_OFF", "ARM", "DISARM")
+STAGE_STOPS = ("CHARGE_STOP", "DRAIN_STOP")
+REJECT_TRACKED = ("ESR", "LEAK", "HEAT", "CHARGE", "DISCHARGE", "ARM", "RAMP", "DRAIN")
 
 
 class EventRecorder:
@@ -41,6 +44,7 @@ class EventRecorder:
         self.lost_since_last = 0      # CGE eventSeq gaps: Nano events the Pi never received
         self.lost_total = 0
         self.duplicates = 0
+        self.trip_snapshot: Optional[Dict[str, object]] = None   # CGX, sent just before its TRIP CGE
         session.subscribe(self.on_frame)
         session.on_command(self.on_command)
 
@@ -72,6 +76,11 @@ class EventRecorder:
 
     def on_frame(self, rec: Received) -> None:
         e = rec.message
+        if isinstance(e, TripSnapshot):
+            self.trip_snapshot = {"trip_code": e.trip, "trip_reason": TRIP_NAMES.get(e.trip, str(e.trip)),
+                                  "tap_mv": e.tap_mv, "adc_tap_raw": e.raw, "bandgap_raw": e.bandgap_raw,
+                                  "voltage_quality_bits": e.voltage_quality, "nano_millis": e.millis}
+            return
         if not isinstance(e, Event):
             return
         if e.code == "BOOT":
@@ -97,9 +106,16 @@ class EventRecorder:
         if e.code in CELL_CODES:
             self._write(t, "COMMANDED", e.code.split("_")[0], e.cell_id, req=e.requested, cmd=e.commanded, cge=cge)
         elif e.code in SYSTEM_CODES:
-            self._write(t, "COMMANDED", "NONE", None, req=e.requested, cmd=e.commanded, cge=cge)
+            stage = None
+            if e.code in STAGE_STOPS and self.s.capabilities.staged_power:
+                # a RAMP / DRAIN stage ended: only a target stop can be a success (LOAD_TAP_UNSTABLE,
+                # TIMEOUT, BUDGET = aborted; limits / trip / host stops are not a reached target)
+                stage = dict(classify_stop(e.reason), stage="RAMP" if e.code == "CHARGE_STOP" else "DRAIN")
+            self._write(t, "COMMANDED", "NONE", None, req=e.requested, cmd=e.commanded, cge=cge, stage_stop=stage)
         elif e.code == "TRIP":
-            self._write(t, "TRIPPED", "NONE", None, cge=cge, trip=e.reason)
+            snap = self.trip_snapshot if self.trip_snapshot and self.trip_snapshot["trip_reason"] == e.reason else None
+            self.trip_snapshot = None
+            self._write(t, "TRIPPED", "NONE", None, cge=cge, trip=e.reason, trip_snapshot=snap)
         elif e.code == "RESET":
             self._write(t, "RESET", "NONE", None, req=1, cmd=1, cge=cge)
         elif e.code == "BOOT":
@@ -112,6 +128,8 @@ class EventRecorder:
             self._write(t, "REQUESTED", "NONE", None, req=name, command=name)
         elif name in ("CHARGE", "DISCHARGE"):
             self._write(t, "REQUESTED", "NONE", None, req=int(args[0]), command=name)
+        elif name in ("RAMP", "DRAIN"):  # requested_value = rested target in mV per cell
+            self._write(t, "REQUESTED", "NONE", None, req=int(args[0]), command=name, unit="mV_per_cell")
         elif name in ("ESR", "LEAK", "HEAT"):
             self._write(t, "REQUESTED", name, int(args[0]), req=int(args[1]))
         else:

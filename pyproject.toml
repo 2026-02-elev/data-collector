@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cellguard-data-collector"
-version = "0.2.0"
+version = "0.3.0"
 description = "CellGuard Raspberry Pi collector: Nano UART (protocol v1.0) + INA219, experiment control, local spool for upload"
 authors = [{ name = "Yongho Ahn", email = "nanhosoft@gmail.com" }]
 requires-python = ">=3.9"
