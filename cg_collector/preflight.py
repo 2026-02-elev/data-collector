@@ -41,7 +41,7 @@ from typing import Callable, Dict, List, Optional
 from . import __version__
 from .current import CurrentSource
 from .protocol import (CalibrationInfo, Event, RawAdc, SELF_TEST_FAIL_BITS, SELF_TEST_WARN_BITS, Status, Telemetry,
-                       TRIP_NAMES, bit_names)
+                       TRIP_NAMES, Version, bit_names)
 from .session import CommandTimeout, NanoSession, Received
 
 PASS, WARN, FAIL, SKIP, UNSUPPORTED = "PASS", "WARN", "FAIL", "SKIP", "UNSUPPORTED"
@@ -69,6 +69,8 @@ class PreflightOptions:
     boot_wait_s: float = 3.0              # a USB-serial Nano resets on open (bootloader ~2 s)
     watch_s: float = 3.0                  # telemetry window
     self_test_timeout_s: float = 3.0
+    reply_timeout_s: float = 1.0          # CGK / CGD / CGS after their command's ACK (separate UART reads)
+    version_timeout_s: float = 2.0        # CGV after the SYNC ACK
     ping_count: int = 5
     max_rtt_ms: float = 100.0
     rest_spread_mv: int = 50              # cell reading spread over the window with every output off
@@ -137,6 +139,8 @@ class _Watch:
         self.transcript: List[Dict[str, str]] = []
         self.limit = limit
         self.active = True
+        self.cgv_after_sync: Optional[Version] = None   # the CGV sent in reply to OUR SYNC (not a boot CGV)
+        self.cgv_malformed: List[str] = []
         session.subscribe(self.on_rx)
         session.on_transmit(self.on_tx)
 
@@ -182,7 +186,9 @@ def _check_link(session: NanoSession, w: _Watch, o: PreflightOptions) -> Check:
     _wait(session, lambda: bool(w.frames), o.boot_wait_s)  # boot frames / telemetry, if any
     heard = len(w.frames)
     try:
-        ack = session.command("SYNC")
+        rep = session.request("SYNC", reply=Version, match_seq=False, timeout_s=o.version_timeout_s)
+        ack = rep.ack
+        w.cgv_after_sync, w.cgv_malformed = rep.message, rep.malformed
     except CommandTimeout:
         return Check("link", FAIL, "no reply to SYNC: check Nano power, TX/RX crossing, 115200 baud and that the "
                                    "serial login console is disabled", {"frames_before_sync": heard,
@@ -204,10 +210,12 @@ def _check_link(session: NanoSession, w: _Watch, o: PreflightOptions) -> Check:
     return Check("link", PASS, f"SYNC OK, PING {data['rtt_ms_median']} ms", data)
 
 
-def _check_firmware(session: NanoSession, o: PreflightOptions) -> Check:
-    v = session.version
+def _check_firmware(session: NanoSession, w: _Watch, o: PreflightOptions) -> Check:
+    v = w.cgv_after_sync  # fresh CGV in reply to our SYNC; a boot CGV seen earlier does not count
     if v is None:
-        return Check("firmware", FAIL, "no CGV version frame after SYNC")
+        if w.cgv_malformed:
+            return Check("firmware", FAIL, "malformed CGV after SYNC", {"frames": w.cgv_malformed[:3]})
+        return Check("firmware", FAIL, f"no CGV version frame within {o.version_timeout_s} s after the SYNC ACK")
     caps = session.capabilities
     from .protocol import CGV_FLAG_BITS
 
@@ -279,16 +287,15 @@ def _check_nano_self_test(session: NanoSession, w: _Watch, o: PreflightOptions) 
 
 
 def _check_nano_status(session: NanoSession, w: _Watch, o: PreflightOptions) -> Check:
-    mark = len(w.frames)
-    try:
-        session.command("STATUS")
+    try:  # CGS carries the telemetry seq, not the command seq: any CGS received after STATUS is current
+        rep = session.request("STATUS", reply=Status, match_seq=False, timeout_s=o.reply_timeout_s)
     except CommandTimeout:
         return Check("nano_status", FAIL, "no reply to STATUS")
-    _wait(session, lambda: bool(w.since(mark, Status)), 0.5)
-    got = w.since(mark, Status)
-    if not got:
-        return Check("nano_status", FAIL, "no CGS status frame")
-    st: Status = got[-1].message
+    if rep.message is None:
+        why = f"malformed CGS: {rep.malformed[0]}" if rep.malformed else \
+            f"no CGS status frame within {o.reply_timeout_s} s after the STATUS ACK"
+        return Check("nano_status", FAIL, why)
+    st: Status = rep.message  # type: ignore[assignment]
     flags = [n for n, b in (("POWER_ON", 1), ("EXTERNAL", 2), ("BROWNOUT", 4), ("WATCHDOG", 8)) if st.reset_flags & b]
     data = {"state": st.state, "trip": TRIP_NAMES.get(st.trip, str(st.trip)), "locks": st.locks,
             "reset_flags": flags, "free_ram": st.free_ram, "rx_crc_err": st.rx_crc_err,
@@ -357,28 +364,33 @@ def _check_telemetry_and_measurement(session: NanoSession, w: _Watch, o: Preflig
     return out
 
 
+def _missing(rep, tag: str, cmd: str, o: PreflightOptions) -> str:
+    if not rep.ack.ok:
+        return f"{cmd} refused: {rep.ack.text}"
+    if rep.malformed:
+        return f"malformed {tag} reply to {cmd}: {rep.malformed[0]}"
+    return f"no {tag} frame with seq {rep.ack.seq} within {o.reply_timeout_s} s after the {cmd} ACK"
+
+
 def _check_adc_path(session: NanoSession, w: _Watch, o: PreflightOptions) -> Check:
-    try:
-        session.command("CAL")
+    try:  # the CGK of THIS CAL (same seq), even when it arrives in a later read than the ACK
+        rep = session.request("CAL", reply=CalibrationInfo, timeout_s=o.reply_timeout_s)
     except CommandTimeout:
         return Check("adc_path", FAIL, "no reply to CAL")
-    cal = session.calibration
-    if cal is None:
-        return Check("adc_path", FAIL, "no CGK calibration frame")
+    if rep.message is None:
+        return Check("adc_path", FAIL, _missing(rep, "CGK", "CAL", o), {"cal_seq": rep.ack.seq})
+    cal: CalibrationInfo = rep.message  # type: ignore[assignment]
     mark = len(w.frames)
     if not _wait(session, lambda: bool(w.since(mark, Telemetry)), 1.5):
         return Check("adc_path", FAIL, "no telemetry to compare with")
     tel: Telemetry = w.since(mark, Telemetry)[-1].message
-    try:
-        session.command("RAW")  # same 5 Hz sample as the CGT just received (next sample is 200 ms later)
+    try:  # right after the CGT: the same 5 Hz sample (next sample is 200 ms later); the CGD of THIS RAW
+        raw_rep = session.request("RAW", reply=RawAdc, timeout_s=o.reply_timeout_s)
     except CommandTimeout:
         return Check("adc_path", FAIL, "no reply to RAW")
-    seq = session.seq
-    _wait(session, lambda: any(r.message.seq == seq for r in w.since(mark, RawAdc)), 0.5)
-    raws = [r.message for r in w.since(mark, RawAdc) if r.message.seq == seq]
-    if not raws:
-        return Check("adc_path", FAIL, "no CGD raw frame")
-    raw = raws[-1].raw
+    if raw_rep.message is None:
+        return Check("adc_path", FAIL, _missing(raw_rep, "CGD", "RAW", o), {"raw_seq": raw_rep.ack.seq})
+    raw = raw_rep.message.raw  # type: ignore[union-attr]
     data: Dict[str, object] = {"raw": raw, "calibration": f"{cal.source}/{cal.cal_id}", "aref_mv": cal.aref_mv}
     if None in tel.cell_mv:
         return Check("adc_path", SKIP, "cell voltages invalid in telemetry (see measurement)", data)
@@ -495,7 +507,7 @@ def run_preflight(session: NanoSession, data_dir: Path, opts: Optional[Preflight
             for name in ("firmware", "nano_self_test", "nano_status", "telemetry", "measurement", "adc_path"):
                 checks.append(Check(name, SKIP, "no link"))
         else:
-            checks.append(_check_firmware(session, o))
+            checks.append(_check_firmware(session, w, o))
             checks.append(_check_nano_self_test(session, w, o))
             checks.append(_check_nano_status(session, w, o))
             checks.extend(_check_telemetry_and_measurement(session, w, o))

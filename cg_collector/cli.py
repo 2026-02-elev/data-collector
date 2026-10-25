@@ -19,6 +19,7 @@ from .fusion import Collector, FusionContext, rfc3339_us
 from .preflight import FAIL, PASS, PreflightOptions, format_report, run_preflight, write_report
 from .replay import read_collector_log, read_ina219_log, replay, replay_generator_run
 from .runner import PlanError, Pump, RunAborted, load_plan, parse_plan, run_steps, shell_command
+from .protocol import CalibrationInfo, RawAdc, Status
 from .session import CommandTimeout, NanoSession, Received, UnsupportedCommand
 from .storage import Outbox, RotatingWriter
 from .transport import SerialTransport, SimTransport, Transport
@@ -197,6 +198,13 @@ def _run_header(path: Path):
     return dt.datetime.fromisoformat(r["run_start_utc"].replace("Z", "+00:00")), r
 
 
+def _calibration(session: NanoSession) -> None:
+    """CAL at the start of a run: wait for ITS CGK so the first records carry the calibration id."""
+    rep = session.request("CAL", reply=CalibrationInfo)
+    if rep.message is None:
+        print("warning: no CGK after CAL - calibration_id stays null until one arrives", file=sys.stderr)
+
+
 def _last_state(session: NanoSession) -> str:
     from .protocol import Status
 
@@ -319,7 +327,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 runner = CycleRunner(session, col.diagnostics, log=lambda m: print(m, flush=True))
                 try:
                     session.command("SYNC")  # every output off, fresh sequence
-                    session.command("CAL")
+                    _calibration(session)
                     runner.run(a.charge_to, a.discharge_to, a.step)
                     rc = 0
                 except (CycleAborted, CommandTimeout, UnsupportedCommand) as exc:
@@ -342,17 +350,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(f"INA219 unavailable ({source_error}): pack current will be null", file=sys.stderr)
 
         if a.cmd == "query":
-            ack = session.command(a.name.upper())
-            print(f"{'OK' if ack.ok else 'ERR'} {ack.text}")
-            session.poll(0.1)
-            for rec in list(session.recent)[-3:]:
-                print(rec.raw)
-            return 0 if ack.ok else 1
+            name = a.name.upper()
+            if name == "PING":
+                ack = session.command(name)
+                print(f"{'OK' if ack.ok else 'ERR'} {ack.text}")
+                return 0 if ack.ok else 1
+            # the reply frame of THIS command (it may arrive in a later read than the ACK)
+            kind, by_seq = {"STATUS": (Status, False), "RAW": (RawAdc, True), "CAL": (CalibrationInfo, True)}[name]
+            rep = session.request(name, reply=kind, match_seq=by_seq)
+            print(f"{'OK' if rep.ack.ok else 'ERR'} {rep.ack.text}")
+            if rep.ack.ok and rep.message is None:
+                print(f"no reply frame within 1 s after the ACK{': ' + rep.malformed[0] if rep.malformed else ''}",
+                      file=sys.stderr)
+                return 1
+            for rec in list(session.recent):
+                if rep.message is not None and rec.message is rep.message:
+                    print(rec.raw)
+            return 0 if rep.ok else 1
 
         if a.cmd == "monitor":
             with collection(a, session, source) as col:
                 session.command("SYNC")
-                session.command("CAL")
+                _calibration(session)
                 try:
                     if a.seconds > 0:
                         session.pump(a.seconds)

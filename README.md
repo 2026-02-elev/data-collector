@@ -66,7 +66,7 @@ pip install -e .                           # cg-collect 명령 설치 (또는 py
 
 # 통합시험은 펌웨어 호스트 시뮬레이터를 빌드해 사용한다 (g++ 필요).
 #   0.2.0: ../arudino-firmware (다른 위치면 CELLGUARD_FIRMWARE_DIR), 0.1.6: tests/fw016 (자동 빌드)
-python3 -m pytest -q        # 89 passed (2026-10-25)
+python3 -m pytest -q        # 98 passed (2026-10-25)
 ```
 
 ## 실물 장비 (0.1.6-LOAD-VERIFY) 사용
@@ -219,6 +219,10 @@ BOOT CHECK: WARN
 | `clock` | 시스템 연도 < 2025 (RTC 없는 Pi 가 NTP 전) | NTP 미동기 |
 | `storage` | 데이터 디렉터리 쓰기 불가, 여유 < 100 MB | 여유 < 1 GB, 비정상 종료로 남은 `.part` |
 
+- 응답 프레임 대기: Nano 는 ACK 를 먼저 보내고 CGK(CAL)·CGD(RAW)·CGV(SYNC)·CGS(STATUS)를 이어서 보낸다. 실물 UART 에서는
+  둘이 서로 다른 읽기로 도착하므로, 점검은 ACK 뒤 최대 1 s(CGV 2 s) 동안 **그 명령 이후에 받은** 응답을 기다린다
+  (CGK·CGD 는 같은 seq 만 인정, 이전 명령의 CGK 는 재사용하지 않음). 응답이 끝내 없거나 형식이 틀릴 때만 FAIL
+  (`no CGK frame with seq N within 1.0 s after the CAL ACK` / `malformed CGK reply to CAL: …`). `NanoSession.request()`.
 - 보고서 `outbox/selftest-<UTC>-<n>.jsonl` (`selftest_report_v1`: 결과, 점검별 상태·근거 데이터, 펌웨어 정보, 점검 중 UART 원문)
   → 데이터 파일과 함께 서버로 간다. 장치가 왜 시작했는지/못 했는지 서버에서 볼 수 있다.
 - Nano 쪽 자체점검 내용과 한계는 펌웨어 `docs/self_test.md`. **출력(릴레이·MOSFET·히터)은 되읽기 회로가 없어 점검하지 않는다**

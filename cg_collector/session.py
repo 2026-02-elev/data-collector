@@ -31,6 +31,23 @@ class CommandTimeout(RuntimeError):
     pass
 
 
+# reply frame type of a command (CGK / CGD carry the command's seq; CGV / CGS do not)
+REPLY_TAG = {"CalibrationInfo": "CGK", "RawAdc": "CGD", "Version": "CGV", "Status": "CGS"}
+
+
+@dataclasses.dataclass
+class Reply:
+    """Result of NanoSession.request(): the ACK, and the reply frame that belongs to it."""
+    ack: Ack
+    message: Optional[Message]
+    malformed: List[str]          # CRC-valid or not, frames of the reply's type that did not parse
+    waited_s: float
+
+    @property
+    def ok(self) -> bool:
+        return self.ack.ok and self.message is not None
+
+
 FAULT_ORDER = {"ESR": 0, "LEAK": 1, "HEAT": 2}
 
 
@@ -299,6 +316,44 @@ class NanoSession:
                         break
             raise CommandTimeout(f"no ACK for {payload}")
 
+    def request(self, name: str, *args: int, reply: type, timeout_s: float = 1.0, match_seq: bool = True) -> Reply:
+        """Sends a command and waits for the frame it causes (CAL -> CGK, RAW -> CGD, SYNC -> CGV, STATUS -> CGS).
+
+        The Nano sends the ACK first and the reply right after it; on a real UART they often arrive in
+        different reads, so the ACK alone says nothing about the reply. Only a reply received AFTER the
+        command was sent counts (an older CGK / CGD is never reused); with ``match_seq`` it must also carry
+        this command's seq. Raises CommandTimeout only for a missing ACK.
+        """
+        tag = REPLY_TAG.get(reply.__name__, "")
+        got: List[Message] = []
+        bad: List[str] = []
+
+        def grab(rec: Received) -> None:
+            if isinstance(rec.message, reply):
+                got.append(rec.message)
+            elif rec.message is None and tag and rec.raw.startswith("$" + tag + ","):
+                bad.append(f"{rec.raw} ({rec.error or rec.unknown_type})")
+
+        with self._lock:
+            self.subscribe(grab)  # before sending: the reply may come in the same read as the ACK
+            try:
+                ack = self.command(name, *args)
+                t0 = self.t.monotonic()
+                if not ack.ok:
+                    return Reply(ack, None, bad, 0.0)
+
+                def match() -> Optional[Message]:
+                    for m in got:
+                        if not match_seq or getattr(m, "seq", None) == ack.seq:
+                            return m
+                    return None
+
+                while match() is None and self.t.monotonic() - t0 < timeout_s:
+                    self._ingest(self.t.read_lines(0.05))
+                return Reply(ack, match(), bad, round(self.t.monotonic() - t0, 3))
+            finally:
+                self.unsubscribe(grab)
+
     def keepalive(self, interval_s: float = 1.0) -> Optional[Ack]:
         """Sends PING when no command was accepted for ``interval_s`` (Nano trips after 5 s)."""
         with self._lock:
@@ -322,4 +377,4 @@ def trip_name(code: int) -> str:
 
 
 __all__ = ["ACTUATION_COMMANDS", "READ_ONLY_COMMANDS", "CommandTimeout", "FaultTracker", "NanoSession",
-           "Received", "Telemetry", "UnsupportedCommand", "trip_name"]
+           "Received", "Reply", "Telemetry", "UnsupportedCommand", "trip_name"]
