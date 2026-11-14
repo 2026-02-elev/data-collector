@@ -1,7 +1,7 @@
 # CellGuard 데이터 수집기 (Raspberry Pi)
 
-> **실물 장비(펌웨어 `0.1.9-RUNTIME`)에서 상시 돌리는 프로그램은 [`edge/`](edge/README.md) (cellguard-edge v3)다.**
-> MLOps 모델로 Pi에서 이상을 판정해 서버에 보고하고, 모델을 OTA로 갱신하며, 데이터 수집 모드와 랜덤 고장(단일·복합) 모드를 오간다.
+> **실물 장비(펌웨어 `0.2.0-RUNTIME`/`0.1.9-RUNTIME`)에서 상시 돌리는 프로그램은 [`edge/`](edge/README.md) (cellguard-edge v3)다.**
+> MLOps 모델로 Pi에서 이상을 판정해 서버에 보고하고, 모델을 OTA로 갱신하며, 데이터 수집 모드와 랜덤 고장(단일·복합, 0.2.0이면 동시) 모드를 오간다.
 > 아래 `cg_collector`는 예전 펌웨어(0.1.6/0.2.0)용 감독형 수집기다.
 
 - 작성/구현: **Yongho Ahn** <nanhosoft@gmail.com>

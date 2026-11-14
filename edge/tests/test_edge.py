@@ -158,3 +158,73 @@ def test_remote_command(tmp_path, cmd, mode):
     assert ce.read_control(e.data)["mode"] == mode
     acks = [d for d in sent(e, "diagnostics") if d["kind"] == "COMMAND_ACK"]
     assert acks and acks[0]["details"]["ok"]
+
+
+def test_fw_concurrent(tmp_path):
+    e = make_edge(tmp_path)
+    for fw, ok in (("0.2.0-RUNTIME", True), ("0.3.1", True), ("0.1.9-RUNTIME", False), ("unknown", False)):
+        e.tel.firmware = fw
+        assert e.fw_concurrent() is ok, fw
+
+
+class FakeNano:
+    def __init__(self):
+        self.cmds = []
+
+    def command(self, name, *args, timeout=0.8, tries=3):
+        self.cmds.append((name, *args))
+        return True, "NONE"
+
+    def sync(self):
+        pass
+
+
+def test_compound_overlap_runs_faults_together(tmp_path, monkeypatch):
+    """Nano 0.2.0: HEAT + LEAK start together, ESR load pulses run while they are on and end with
+    DISCHARGE 0 / ESR n 0 (not OFF), each fault stops at its own time, a single OFF at the very end."""
+    e = make_edge(tmp_path)
+    clock = [1000.0]
+    monkeypatch.setattr(ce.time, "monotonic", lambda: clock[0])
+
+    def wait(seconds, guard=None, until=None):
+        if guard:
+            guard()
+        clock[0] += seconds
+        return False
+
+    e.wait = wait
+    e.nano = FakeNano()
+    e.tel.firmware = "0.2.0-RUNTIME"
+    e.tel.runtime = {"profile": 1, "enabled": 15, "heat_pwm": 32, "heat_s": 20, "esr_s": 4, "leak_s": 60}
+    e.tel.cells, e.tel.temps = [600, 605, 598, 602], [25.0] * 4
+    e.need_cells = lambda: [600, 605, 598, 602]
+    e.tel.filtered = lambda: [600, 605, 598, 602]
+    e.spread_guard = lambda: None
+    refs = []
+    e.load_pulse = lambda cell=None: refs.append(cell) or 5
+    e.episode = {"id": "r:e00001", "applied": [], "skipped": [], "detections": []}
+    faults = [{"kind": "heat", "cell": 2, "fraction": 1.0}, {"kind": "leak", "cell": 3, "fraction": 0.5},
+              {"kind": "esr", "cell": 2, "pulses": 2}]
+    e.compound_overlap(faults)
+
+    cmds = e.nano.cmds
+    assert refs == [None]                                        # no-ESR reference pulse first
+    assert cmds[:3] == [("ARM",), ("HEAT", 2, 32), ("LEAK", 3, 1)]
+    assert cmds.count(("ESR", 2, 1)) == 2 and cmds.count(("DISCHARGE", 0)) == 2 and cmds.count(("ESR", 2, 0)) == 2
+    assert [c for c in cmds if c[0] == "OFF"] == [("OFF",)] and cmds[-1] == ("OFF",)
+    i_heat, i_leak = cmds.index(("HEAT", 2, 0)), cmds.index(("LEAK", 3, 0))
+    assert i_heat < i_leak                                       # 20 s heat ends before the 30 s leak
+    assert cmds.index(("DRAIN", 498)) < i_heat                  # ESR pulses inside the overlap
+    applied = {(a["kind"], a["cell"]): a for a in e.episode["applied"]}
+    assert applied[("heat", 2)]["seconds"] == 20 and applied[("leak", 3)]["seconds"] == 30
+    assert applied[("esr", 2)]["pulses"] == 2 and all(a["overlap"] for a in applied.values())
+    assert e.fault_req is None                                   # OFF clears the request
+
+
+def test_compound_overlap_skips_disabled_kind(tmp_path):
+    e = make_edge(tmp_path)
+    e.tel.runtime = {"profile": 1, "enabled": 1 | 4, "leak_s": 60}   # POWER + LEAK only
+    e.episode = {"id": "r:e00002", "applied": [], "skipped": [], "detections": []}
+    e.need_cells = lambda: (_ for _ in ()).throw(AssertionError("must not touch the rig"))
+    e.compound_overlap([{"kind": "heat", "cell": 1, "fraction": 1.0}, {"kind": "esr", "cell": 1, "pulses": 2}])
+    assert [s["step"] for s in e.episode["skipped"]] == ["heat@1", "esr@1"]

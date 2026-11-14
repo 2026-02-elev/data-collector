@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""CellGuard edge (Raspberry Pi <-> Nano 0.1.9-RUNTIME, MQTT over TLS, on-device AI with OTA).
+"""CellGuard edge (Raspberry Pi <-> Nano 0.2.0-RUNTIME / 0.1.9, MQTT over TLS, on-device AI with OTA).
 
 Modes (control.json "mode", CLI `mode`, or MQTT cellguard/v1/{device}/command)
 - collect : systematic cycle (charge -> stimulus -> balance -> drain), stimuli rotate over cells
-- fault   : random episodes - none / single / compound faults (2-3 kinds, sequential with
-            overlapping effects: the firmware allows one actuator probe at a time)
+- fault   : random episodes - none / single / compound faults (2-3 kinds). Nano >= 0.2.0
+            runs them at the same time (HEAT + LEAK on, ESR load pulses during the overlap);
+            0.1.9 allows one actuator at a time, so there they run back to back
 - passive : telemetry only, outputs off
 In every mode the AI models (MLOps residual / classifier / load_esr) judge each sample on the Pi.
 A confirmed anomaly is reported to the server (diag AI_DETECTION + fault_event OBSERVABLE) with
@@ -96,6 +97,7 @@ DEFAULT_CONFIG = {
     "fault_kinds": ["esr", "leak", "heat"],
     "fault_triple_p": 0.25,           # compound: chance of 3 kinds instead of 2
     "fault_same_cell_p": 0.5,         # compound: all on one cell vs. random cells
+    "fault_overlap": True,            # compound on Nano >= 0.2.0: faults at the same time (False: back to back)
     "fault_partial_min": 0.5,         # leak/heat stopped after a random 50..100 % of the firmware limit
     "episode_baseline_s": 30, "episode_hold_s": 20, "episode_post_s": 45, "episode_rest_s": 30,
     # AI + OTA
@@ -1464,7 +1466,14 @@ class Edge:
                     self.off()
                     ep["skipped"].append({"step": step, "why": str(e)})
             rt = self.tel.runtime or {}
-            for f in plan["faults"]:
+            ep["overlap"] = len(plan["faults"]) > 1 and c["fault_overlap"] and self.fw_concurrent()
+            if ep["overlap"]:
+                try:
+                    self.compound_overlap(plan["faults"])
+                except Skip as e:
+                    self.off()
+                    ep["skipped"].append({"step": "compound", "why": str(e)})
+            for f in [] if ep["overlap"] else plan["faults"]:
                 try:
                     if f["kind"] == "esr":
                         self.stimulus("esr", f["cell"], pulses=f["pulses"])
@@ -1498,6 +1507,144 @@ class Edge:
             self._save_state()
             self.diag("EPISODE_RESULT", f"episode {n} {outcome}", **self.score_episode(ep, outcome))
 
+    # -- compound faults at the same time (Nano >= 0.2.0)
+    def fw_concurrent(self) -> bool:
+        """Nano 0.2.0+ runs ESR/LEAK/HEAT together (0.1.9: one actuator probe at a time)."""
+        try:
+            major, minor = (int(x) for x in self.tel.firmware.split("-")[0].split(".")[:2])
+        except ValueError:
+            return False
+        return (major, minor) >= (0, 2)
+
+    def compound_overlap(self, faults: list) -> None:
+        """All faults of the episode at once. LEAK/HEAT start together and stay on while the ESR
+        load pulses run; a pulse ends with DISCHARGE 0 + ESR n 0, never OFF (OFF ends every fault).
+        Each LEAK/HEAT stops at its own planned time; the firmware times each one out by itself too."""
+        c, rt, ep = self.cfg, self.tel.runtime or {}, self.episode
+        self.phase = "compound"
+        if rt.get("profile") != 1:
+            raise Skip(f"Nano runtime profile is not OPERATE: {rt}")
+        todo = []
+        for f in faults:
+            name, bit = FEATURE[f["kind"]]
+            if (rt.get("enabled", 0) >> bit) & 1:
+                todo.append(f)
+            else:
+                ep["skipped"].append({"step": f"{f['kind']}@{f['cell']}",
+                                      "why": f"{name} disabled by Nano runtime config"})
+        if not todo:
+            return
+        cells = self.need_cells()
+        if min(cells) < 320 or max(cells) > 980:
+            raise Skip(f"cells {cells} outside 320..980 mV for compound faults")
+        heated = [f["cell"] for f in todo if f["kind"] == "heat"]
+        if heated:
+            temps = self.tel.temps
+            if any(t is None for t in temps) or max(temps) >= c["heat_start_max_c"]:
+                raise Skip(f"heat needs valid temperatures under {c['heat_start_max_c']} C: {temps}")
+        esr = next((f for f in todo if f["kind"] == "esr"), None)
+        if esr is not None:
+            self.load_pulse(None)              # no-ESR reference right before (balances if needed)
+            self.wait(3)
+        else:
+            self.ready_for_power()             # same spread rule as a single LEAK/HEAT
+        leaking = any(f["kind"] == "leak" for f in todo)
+
+        def guard():
+            for k in heated:
+                t = self.tel.temps[k - 1]
+                if t is None or t >= c["heat_guard_c"]:
+                    self.off()
+                    raise Skip(f"heat guard: cell {k} at {t} C")
+            if leaking:
+                g = self.tel.filtered()
+                if g is not None and min(g) < 300:
+                    self.off()
+                    raise Skip("leak: lowest cell under 300 mV")
+            self.spread_guard()
+
+        self.fault_req = {"type": "COMPOUND", "active": True, "purpose": "injection", "episode_id": ep["id"],
+                          "faults": [{"type": FEATURE[f["kind"]][0], "cell_id": f["cell"]} for f in todo]}
+        ends = []                              # [t_end, NAME, cell] of each LEAK/HEAT still on
+
+        def stop_due():
+            now = time.monotonic()
+            for e in [e for e in ends if e[0] <= now]:
+                ends.remove(e)
+                self.cmd(e[1], e[2], 0)        # ALREADY if the firmware timed it out first
+
+        try:
+            self.arm()
+            for f in todo:
+                if f["kind"] == "esr":
+                    continue
+                kind, cell = f["kind"], f["cell"]
+                name = FEATURE[kind][0]
+                limit = int(rt.get(f"{kind}_s", 60))
+                secs = min(limit, max(5, int(limit * f.get("fraction", 1.0))))
+                value = min(32, int(rt.get("heat_pwm", 32))) if kind == "heat" else 1
+                ok, text = self.cmd(name, cell, value)
+                if not ok:
+                    self.fault_event("FAULT_REJECTED", name, cell, {"reason": text, "overlap": True})
+                    ep["skipped"].append({"step": f"{kind}@{cell}", "why": f"{name} refused: {text}"})
+                    continue
+                self._note_applied(kind, cell, seconds=secs, overlap=True)
+                ends.append([time.monotonic() + secs, name, cell])
+            if esr is not None:
+                self._note_applied("esr", esr["cell"], pulses=0, overlap=True)
+                rec = ep["applied"][-1]
+                for k in range(int(esr.get("pulses") or c["esr_pulses"])):
+                    stop_due()
+                    self.phase = "esr_injection"
+                    self.overlap_pulse(esr["cell"], guard)
+                    rec["pulses"] = k + 1
+                    self.phase = "compound"
+                    self.wait(4, guard=guard)
+            while ends:
+                self.wait(max(0.0, min(e[0] for e in ends) - time.monotonic()), guard=guard)
+                stop_due()
+        finally:
+            self.off()
+
+    def overlap_pulse(self, cell: int, guard) -> int:
+        """One ESR load pulse while other faults stay on (see compound_overlap). Every finished
+        DRAIN disarms the Nano, so each pulse arms again. Returns the number of CGP received."""
+        c = self.cfg
+        f = self.need_cells()
+        if min(f) < c["pulse_min_cell_mv"]:
+            raise Skip(f"cells {f} too low for a load pulse (>= {c['pulse_min_cell_mv']} mV)")
+        target = max(100, min(950, int(min(self.tel.cells or f)) - 100))
+        n0 = getattr(self, "loaded_n", 0)
+        self.arm()
+        t_esr = time.monotonic()
+        ok, text = self.cmd("ESR", cell, 1)
+        if not ok:
+            self.fault_event("FAULT_REJECTED", "ESR", cell, {"reason": text, "overlap": True})
+            raise Skip(f"ESR refused: {text}")
+        t0 = time.monotonic()
+        try:
+            self.wait(1.0, until=lambda: self.tel.event_since(t_esr, "ESR_START") is not None)
+            self.wait(c["pulse_settle_s"], guard=guard)
+            self.cmd("HLOG", 1)
+            self.cmd("HMARK", 3)
+            t0 = time.monotonic()
+            ok, text = self.cmd("DRAIN", target)
+            if not ok:
+                raise Skip(f"load pulse DRAIN refused: {text}")
+            self.wait(1.5, guard=guard, until=lambda: self.tel.event_since(t0, "DRAIN_START") is not None)
+            self.wait(c["pulse_s"], guard=guard)
+        finally:
+            for name, args in (("DISCHARGE", (0,)), ("ESR", (cell, 0)), ("HMARK", (0,)), ("HLOG", (0,))):
+                try:
+                    self.nano.command(name, *args)
+                except LinkError:
+                    pass
+        self.wait(1.5, until=lambda: self.tel.event_since(t0, "DRAIN_STOP") is not None)
+        got = getattr(self, "loaded_n", 0) - n0
+        if got < 2:
+            self.notes["pulse_few_cgp"] += 1
+        return got
+
     @staticmethod
     def score_episode(ep: dict, outcome: str) -> dict:
         """Which applied faults the AI caught (and how fast), and what it flagged with nothing applied."""
@@ -1515,6 +1662,7 @@ class Edge:
                            "latency_s": None if hit is None else round(hit["t"] - a["t"], 1),
                            **{k: a[k] for k in ("seconds", "pulses") if k in a}})
         return {"episode_id": ep["id"], "outcome": outcome, "shape": ep["plan"]["shape"], "plan": ep["plan"],
+                "overlap": bool(ep.get("overlap")),
                 "skipped": ep["skipped"], "faults": faults,
                 "detected": sum(f["detected"] for f in faults), "applied": len(faults),
                 "false_alarms": [{"model": d["model"], "type": d["type"], "cell": d["cell"],
