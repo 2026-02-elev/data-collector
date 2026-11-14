@@ -1299,6 +1299,9 @@ class Edge:
             self.fault_req = {"type": "NONE", "cell_id": None, "active": False, "purpose": "control_load"}
         t0 = time.monotonic()
         try:
+            # the Nano sends CGP only with the health log on and stage 3 (load); SYNC clears both
+            self.cmd("HLOG", 1)
+            self.cmd("HMARK", 3)
             ok, text = self.cmd("DRAIN", target)
             if not ok:
                 raise Skip(f"load pulse DRAIN refused: {text}")
@@ -1306,6 +1309,11 @@ class Edge:
             self.wait(c["pulse_s"], guard=self.spread_guard)
         finally:
             self.off()
+            for name, arg in (("HMARK", 0), ("HLOG", 0)):
+                try:
+                    self.nano.command(name, arg)
+                except LinkError:
+                    pass
         self.wait(1.5, until=lambda: self.tel.event_since(t0, "DRAIN_STOP") is not None)
         got = getattr(self, "loaded_n", 0) - n0
         if got < 2:
