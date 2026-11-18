@@ -1,0 +1,20 @@
+# systemd --user unit (pi 계정, linger=yes 이므로 부팅 때 자동 시작, sudo 불필요)
+# 설치: install.sh 가 ~/.config/systemd/user/ 로 복사한다
+[Unit]
+Description=CellGuard edge (Nano UART -> MQTT TLS, on-device AI, model OTA)
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/python3 -u %h/cellguard-edge/cellguard_edge.py run
+WorkingDirectory=%h/cellguard-edge
+Restart=always
+RestartSec=10
+WatchdogSec=120
+TimeoutStopSec=10
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target
