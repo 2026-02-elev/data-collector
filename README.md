@@ -10,6 +10,95 @@
 > 릴레이·MOSFET·히터가 물리적으로 동작했다는 뜻이 아니다. 이 프로그램은 무인 충방전/히터 운용을 승인하지 않는다.
 > 이 저장소의 시험은 모두 시뮬레이터(펌웨어 소스를 PC 용으로 빌드한 것)로 했으며 **실물 장비에서는 실행하지 않았다.**
 
+## MQTT Descriptor (11/18 Fix)
+
+### 1. 토픽과 메시지 식별
+
+| 필드 | 예시 값 | 뜻 |
+|---|---|---|
+| (토픽) `cellguard/v1/cellguard-pi-01/telemetry` | | `cellguard/v1/{장비ID}/{종류}`. 종류는 telemetry, events, selftest, diagnostics, command 다섯 가지다 |
+| `schema_version` | `normalized_sample_v1` | 이 JSON이 따르는 스키마 이름. 시뮬레이터 데이터와 같은 스키마라서 실측과 합성 데이터를 한 형식으로 다룬다 |
+| `device_id` | `cellguard-pi-01` | 보낸 장비(Pi). 토픽의 장비 ID와 같아야 게이트웨이가 받아 준다 |
+| `run_id` | `edge-20261117T154401Z-b51f` | 엣지 프로그램이 한 번 시작될 때마다 새로 생기는 ID. `edge-<시작 시각 UTC>-<랜덤 4자리>` 형식이다. 여기서는 11-18 00:44:01 KST에 부팅되며 시작됐다 |
+| `message_id` | `…b51f:000052843` | `run_id:일련번호`. 일련번호는 그 실행에서 보낸 **모든 메시지**(텔레메트리, 진단, 이벤트)를 함께 센다. 그래서 `telemetry_seq`와 숫자가 다르다. 중복 수신을 거르는 키로 쓴다 |
+| `edge_version` | `3.0.0` | Pi 엣지 프로그램 버전 |
+
+### 2. 어떤 데이터인지
+
+| 필드 | 예시 값 | 뜻 |
+|---|---|---|
+| `source` | `measured_normal` | 실측 데이터다. 고장 출력(ESR, LEAK, 히터)이 하나라도 켜져 있으면 `measured_fault_injection`이 된다. 시뮬레이터 데이터는 다른 값을 쓴다 |
+| `pack_id` | `pack-01` | 배터리 팩 ID. 셀 4개짜리 팩 하나다 |
+| `scenario_id` | `edge_passive_v3` | `edge_{지금 실제로 돌고 있는 모드}_v3`. 모드는 passive, collect, fault 중 하나다 |
+| `phase` | `passive` | 그 모드 안에서의 세부 단계. 예: `charge`, `drain`, `esr_injection`, `compound`, `trip_recovery` |
+| `cycle_id` | `null` | 진행 중인 사이클이나 고장 에피소드의 ID(`run_id:e00012` 형식). passive에서는 없다 |
+
+### 3. 시간
+
+| 필드 | 예시 값 | 뜻 |
+|---|---|---|
+| `timestamp_utc` | `2026-11-18T06:23:13.015Z` | Pi가 이 샘플을 만든 시각(UTC). 한국 시간은 +9시간이라 15:23:13이다 |
+| `t_sim_s` | `52751.088` | 엣지 프로그램이 시작된 뒤 지난 초(약 14시간 39분). 이름은 시뮬레이터 스키마에서 물려받았다 |
+| `nano_millis` | `52880825` | Nano가 켜진 뒤 지난 밀리초(약 14시간 41분). Nano가 Pi 프로그램보다 2분쯤 먼저 켜졌다는 뜻이다 |
+| `telemetry_seq` | `52880` | Nano가 매긴 텔레메트리 프레임 번호. 1초에 1씩 늘어난다. 중간이 비면 UART에서 프레임을 잃은 것이다 |
+
+### 4. 측정값
+
+| 필드 | 예시 값 | 뜻 |
+|---|---|---|
+| `cell_voltage_v` | `[0.0, 0.0, 0.0, 0.0]` | 셀 1~4 각각의 전압(V, mV 단위 정밀도). 배열 0번이 셀 1이고 스택 맨 아래다. 셀은 4.7 F 슈퍼캡이다. 전압을 믿을 수 없을 때는 `null`이 되고, 원래 값은 `untrusted_cell_voltage_mv`에 따로 들어간다 |
+| `cumulative_tap_voltage_v` | `[0.0, 0.0, 0.0, 0.0]` | 아래에서부터 더한 전압이다. 셀1, 셀1+2, 셀1+2+3, 셀1+2+3+4 순서다. 마지막 값이 팩 전체 전압이다. Pi가 셀 전압을 더해서 만든 값이다 |
+| `spread_mv` | `0` | 가장 높은 셀과 가장 낮은 셀의 차이(mV). 셀 불균형 지표다. 펌웨어는 80 mV에서 트립(`CELL_IMBALANCE`)한다 |
+| `cell_temperature_c` | `[21.53, 20.96, 21.39, 21.46]` | 셀 1~4 온도(°C). 센서가 이상하면 `null`이 된다 |
+| `temperature_quality` | `["VALID", …]` | 온도 센서마다의 상태. 값은 `VALID`, `SATURATED_OR_OPEN`(끊김), `SHORT_OR_LOW`(단락), `ADC_INVALID` 중 하나다 |
+| `pack_current_a` | `null` | 팩 전류(A). INA219 전류 센서를 아직 읽지 않아서 항상 비어 있다 |
+| `current_quality` | `INA219_UNAVAILABLE` | 전류값이 비어 있는 이유 |
+
+### 5. 측정 품질
+
+| 필드 | 예시 값 | 뜻 |
+|---|---|---|
+| `voltage_quality` | `VALID` | 전압값 전체의 상태를 한 단어로 정리한 것. 값은 `VALID`, `ADC_SATURATED`, `TAP_INVERSION`, `AREF_INVALID`, `MISSING`, `OTHER_ERROR` 중 하나다 |
+| `voltage_quality_bits` | `16` | Nano가 보낸 원래 비트들. 1 = ADC 포화, 2 = 탭 역전, 4 = 기준전압 이상, 8 = 오래된 값, **16 = 팩 전압이 거의 0(경고)**. 1~8은 오류라서 `voltage_quality`가 VALID가 아니게 된다. 16은 경고일 뿐이라 VALID로 남는다. 지금 셀이 방전돼 있어서 16이 켜져 있다 |
+| `calibration_id` | `NOMINAL_UNCALIBRATED` | Nano ADC 보정값의 ID. 실측으로 보정하지 않고 부품 공칭값으로 계산하고 있다는 뜻이다. 그래서 전압 절대값에는 수 % 오차가 있을 수 있다 |
+
+### 6. Pi가 Nano에 시킨 출력 (명령 상태)
+
+| 필드 | 예시 값 | 뜻 |
+|---|---|---|
+| `charge_commanded` | `false` | 충전 경로(+5V → 릴레이 → 스택)를 켜라고 했는지 |
+| `discharge_commanded` | `false` | 방전 부하(DRAIN)를 켜라고 했는지 |
+| `pack_relay_commanded` | `false` | 팩 릴레이가 붙어 있는지. 딸깍 소리가 나는 그 릴레이다 |
+| `armed_commanded` | `false` | Nano가 ARMED 상태인지. 출력을 켤 수 있는 상태라는 뜻이다 |
+| `esr_command_mask` | `0` | ESR(내부저항 증가) 고장을 건 셀들. 비트마다 셀 하나다. 1 = 셀1, 2 = 셀2, 4 = 셀3, 8 = 셀4. 예를 들어 5는 셀1과 셀3이다 |
+| `leak_command_mask` | `0` | LEAK(누설) 고장을 건 셀. 비트 방식은 ESR과 같다. 밸런싱에도 이 출력을 쓴다 |
+| `heater_pwm_command` | `[0, 0, 0, 0]` | 셀마다 히터 세기(PWM 0~255). HEAT 고장 재현에 쓴다 |
+
+### 7. 안전 상태 (Nano 펌웨어)
+
+| 필드 | 예시 값 | 뜻 |
+|---|---|---|
+| `controller_state` | `READY` | Nano 상태. 값은 `BOOT_SAFE`, `SELF_TEST`, `LOCKED`, `READY`(대기), `ARMED`, `ACTIVE`(출력 동작 중), `TRIPPED`(보호 정지) 중 하나다 |
+| `trip_code` / `trip_reason` | `0` / `NONE` | 마지막 보호 정지 사유. 예: 2 `CELL_OV`(셀 과전압), 3 `OVER_TEMP`, 4 `HEARTBEAT_TIMEOUT`(Pi 응답 끊김), 13 `CHARGE_NO_RESPONSE`(충전해도 전압이 안 오름), 16 `CELL_IMBALANCE` |
+
+### 8. 고장 정답과 검증 표시 (AI 학습과 채점용)
+
+| 필드 | 예시 값 | 뜻 |
+|---|---|---|
+| `fault_requested` | `null` | Pi가 지금 의도적으로 걸고 있는 고장, 즉 **정답 라벨**이다. 예: `{"type":"ESR","cell_id":1,"active":true,"purpose":"injection","episode_id":…}`. 서버는 이 값으로 AI 탐지가 맞았는지 채점한다 |
+| `fault_modeled_applied` | `null` | 시뮬레이터가 모델로 적용한 고장. 실측에서는 항상 비어 있다 |
+| `physical_fault_verified` | `false` | 고장이 실제로 걸렸는지 따로(계측기 등으로) 확인했는지. 엣지는 확인하지 않으므로 항상 false다 |
+| `physical_harness_verified` | `false` | 배선과 하네스를 따로 검증했는지. 이것도 항상 false다 |
+
+### 9. 버전과 원본 추적
+
+| 필드 | 예시 값 | 뜻 |
+|---|---|---|
+| `firmware_version` | `0.2.0-RUNTIME` | Nano 펌웨어 버전. 지난번에 구운 복합 고장 버전이다 |
+| `hardware_revision` | `PCB2-20260918-R2` | 메인 보드(PCB2) 리비전. Pi 설정에 적힌 값이다 |
+| `protocol_version` | `1.0` | Pi와 Nano 사이 UART 프로토콜 버전 |
+| `raw_log_ref` | `edge:raw/uart-20261118.log#CGT52880` | 이 샘플의 원본 위치. Pi의 `~/cellguard-edge/data/raw/uart-20261118.log`에서 seq 52880인 CGT 프레임이다. 값이 이상할 때 Nano가 실제로 보낸 원문을 찾아볼 수 있다 |
+
 ## 펌웨어 호환성
 
 `SYNC` 응답의 `CGV` 버전 문자열로 펌웨어 계열을 판별하고(`cg_collector/firmware.py`), **그 펌웨어가 지원하지 않는 명령은
