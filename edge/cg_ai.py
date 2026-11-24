@@ -8,6 +8,7 @@ OTA 패키지의 test_vectors.json으로 이 코드가 서버와 같은 값을 �
 모델 (MLOps 이름 → 엣지가 하는 일)
     residual    ② 잔차 + EWMA. 1초 측정마다 셀별 점수. 실측 모델은 온도 상승 점수라 과열을 맡는다
     classifier  ③ 고장 분류기. 최근 20초 창으로 셀별 정상/내부저항/누설/과열. 실측에서 누설·과열을 맡는다
+                멀티레이블 모델(classifier_type=multilabel)이면 셀마다 고장을 여러 개 낸다 (한 셀의 누설+과열 등)
     load_esr    부하 측정(CGP) 내부저항 판정. 부하 전압과 직전 휴지 전압 차이로 내부저항 증가 셀을 찾는다
 
 ADR-006: 이 판정은 진단 정보다. 펌웨어 보호(①)를 대신하거나 우회하지 않는다. Pi는 판정 결과로 출력을 켜지 않는다.
@@ -205,25 +206,63 @@ def window_features(t, v, z, reg, temp, i) -> np.ndarray:
     return feats
 
 
+FAULT_CLASSES = ("esr", "leak", "heat")      # 멀티레이블 출력 순서이자, 확률이 같을 때 대표 label 우선순위
+
+
+def _sigmoid(z: np.ndarray) -> np.ndarray:
+    """큰 로짓에서도 넘치지 않는 sigmoid (MLOps edge_ref/classifier.py와 같은 계산)."""
+    z = np.asarray(z, dtype=float)
+    out = np.empty(z.shape, dtype=float)
+    with np.errstate(over="ignore", under="ignore"):
+        pos = z >= 0
+        out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+        ez = np.exp(z[~pos])
+        out[~pos] = ez / (1.0 + ez)
+    return out
+
+
 def mlp_forward(model: dict, x: np.ndarray) -> np.ndarray:
+    """단일 레이블(기존)은 softmax (N, 클래스). classifier_type=multilabel이면 고장별 독립 sigmoid (N, 고장)."""
     h = (x - np.asarray(model["norm_mean"])) / np.asarray(model["norm_std"])
     layers = model["layers"]
     for k, layer in enumerate(layers):
         h = h @ np.asarray(layer["W"]) + np.asarray(layer["b"])
         if k < len(layers) - 1:
             h = np.maximum(h, 0.0)
+    if model.get("classifier_type") == "multilabel":
+        return _sigmoid(h)
     h = h - h.max(axis=1, keepdims=True)
     e = np.exp(h)
     return e / e.sum(axis=1, keepdims=True)
 
 
 class FaultClassifier:
+    """셀마다 고장 판정. 모델 파일의 classifier_type으로 두 방식이 갈린다.
+        없음 / single_label / softmax   기존. 셀마다 클래스 하나 (label)
+        multilabel                      ESR·LEAK·HEAT 독립 확률, 모델 파일의 thresholds 이상이면 그 고장 (labels, 여러 개 가능)
+    출력: probs, label(셀마다 대표 하나), labels(셀마다 고장 목록, 정상이면 []), classifier_type, classes."""
+
     def __init__(self, model: dict):
+        kind = model.get("classifier_type")
+        if kind not in (None, "single_label", "softmax", "multilabel"):
+            raise ValueError(f"unknown classifier_type {kind!r}")
+        self.multi = kind == "multilabel"
         self.model = model
         self.window = int(model["window_s"])
         self.min_valid = float(model.get("min_valid_frac", 0.5))
-        self.classes = model["classes"]
         self.use_current = bool(model.get("use_current", False))
+        if self.multi:
+            if model.get("output_activation") != "sigmoid":
+                raise ValueError("multilabel model needs output_activation 'sigmoid'")
+            self.classes = [str(c).lower() for c in model["classes"]]
+            if any(c not in FAULT_CLASSES for c in self.classes):
+                raise ValueError(f"multilabel classes must be in {FAULT_CLASSES}: {self.classes}")
+            thr = {str(k).lower(): float(v) for k, v in (model.get("thresholds") or {}).items()}
+            if set(thr) != set(self.classes) or not all(0.0 < v <= 1.0 for v in thr.values()):
+                raise ValueError("multilabel model needs thresholds in (0, 1] for every class")
+            self.thresholds = np.array([thr[c] for c in self.classes])
+        else:
+            self.classes = model["classes"]
         self.residual = ResidualScorer(model["residual"])
         self.buf = deque(maxlen=self.window)
 
@@ -241,7 +280,15 @@ class FaultClassifier:
             return None
         zz = np.where(np.isfinite(z), z, 0.0)
         probs = mlp_forward(self.model, window_features(t, v, zz, reg_a, temp, i))
-        return {"probs": probs, "label": [self.classes[j] for j in probs.argmax(axis=1)]}
+        if not self.multi:
+            label = [self.classes[j] for j in probs.argmax(axis=1)]
+            return {"probs": probs, "label": label, "labels": [[] if c == "normal" else [c] for c in label],
+                    "classifier_type": "single_label", "classes": list(self.classes)}
+        labels = [[c for c, on in zip(self.classes, row) if on] for row in probs >= self.thresholds]
+        label = [max(ls, key=lambda c, k=k: (probs[k, self.classes.index(c)], -FAULT_CLASSES.index(c)))
+                 if ls else "normal" for k, ls in enumerate(labels)]
+        return {"probs": probs, "label": label, "labels": labels, "classifier_type": "multilabel",
+                "classes": list(self.classes)}
 
 
 # =========================================================================== load ESR (edge_ref/load_check.py)
@@ -519,8 +566,12 @@ class Detector:
 
     - ② residual: 셀 경보가 confirm_steps번 이어지면 확정. 점수 중 온도 몫이 크면 HEAT, 아니면 ANOMALY
     - ③ classifier: 같은 고장 클래스가 confirm_windows번 이어지고 확률 >= min_prob 이면 확정 (report_classes만)
+      멀티레이블 모델(classifier_type=multilabel)은 셀·고장마다 따로 센다. labels에 그 고장이
+      confirm_windows번 이어지면 확정 (확률 기준은 모델 파일의 thresholds라 min_prob는 쓰지 않는다).
+      한 셀에 누설과 과열이 같이 확정될 수 있다
     - load_esr: 부하 측정 한 번의 경보로 바로 확정 (측정이 드물다)
-    해제: 경보가 clear_steps번 연속으로 없을 때. 같은 (모델, 셀)은 해제 전까지 다시 보고하지 않는다.
+    해제: 경보가 clear_steps번 연속으로 없을 때. 같은 (모델, 셀)은 해제 전까지 다시 보고하지 않는다
+    (멀티레이블은 같은 (셀, 고장)).
     """
 
     def __init__(self, cfg: dict):
@@ -540,6 +591,7 @@ class Detector:
         self.cls_last = [None] * 4
         self.cls_quiet = [0] * 4
         self.cls_active = [None] * 4
+        self.cls_multi = {}                 # (셀 0~3, 고장) → [연속 수, 조용한 수, 확정 여부]  멀티레이블용
         self.esr_active_until = [0.0] * 4
 
     def residual(self, out: dict) -> list[dict]:
@@ -569,6 +621,8 @@ class Detector:
         events = []
         if out is None:
             return events
+        if out.get("classifier_type") == "multilabel":
+            return self._classifier_multi(out)
         probs = np.asarray(out["probs"], float)
         for k, label in enumerate(out["label"]):
             p = float(probs[k].max())
@@ -592,6 +646,39 @@ class Detector:
                                    "class": self.cls_active[k]})
                     self.cls_active[k] = None
         return events
+
+    def _classifier_multi(self, out: dict) -> list[dict]:
+        events = []
+        probs = np.asarray(out["probs"], float)
+        classes = list(out["classes"])
+        for k, labels in enumerate(out["labels"]):
+            for fault in sorted(self.report_classes & set(classes)):
+                st = self.cls_multi.setdefault((k, fault), [0, 0, False])
+                if fault in labels:
+                    st[0] += 1
+                    st[1] = 0
+                    if not st[2] and st[0] >= self.cls_confirm:
+                        st[2] = True
+                        events.append({"model": "classifier", "event": "detected", "cell": k + 1,
+                                       "fault_type": CLASS_TO_FAULT[fault], "class": fault,
+                                       "prob": round(float(probs[k][classes.index(fault)]), 3),
+                                       "probs": [round(float(x), 3) for x in probs[k]]})
+                else:
+                    st[0] = 0
+                    st[1] += 1
+                    if st[2] and st[1] >= self.clear_steps:
+                        st[2] = False
+                        events.append({"model": "classifier", "event": "cleared", "cell": k + 1, "class": fault})
+        return events
+
+    def active_classifier(self) -> dict:
+        """셀별로 확정 중인 ③ 고장 (상태 표시용). 멀티레이블은 '+'로 이어서 보여준다."""
+        out = {str(k + 1): c for k, c in enumerate(self.cls_active) if c}
+        for k in range(4):
+            on = sorted(f for (c, f), st in self.cls_multi.items() if c == k and st[2])
+            if on:
+                out[str(k + 1)] = "+".join(on)
+        return out
 
     def load_esr(self, out: dict, now: float) -> list[dict]:
         events = []
@@ -702,7 +789,7 @@ class AiEngine(threading.Thread):
         if c is not None:
             out = c.update(step)
             if out is not None:
-                self.last_out["classifier"] = {"label": out["label"]}
+                self.last_out["classifier"] = {"label": out["label"], "labels": out.get("labels")}
             self._emit(self.detector.classifier(out))
 
     def _loaded(self, v_load, nano_ms, direction, esr_mask):
@@ -725,7 +812,7 @@ class AiEngine(threading.Thread):
         return {"models": self.versions, "stats": dict(self.stats), "last_error": self.last_error,
                 "queue": self.q.qsize(), "last": self.last_out,
                 "active": {"residual": [k + 1 for k in range(4) if self.detector.res_active[k]],
-                           "classifier": {str(k + 1): c for k, c in enumerate(self.detector.cls_active) if c}}}
+                           "classifier": self.detector.active_classifier()}}
 
 
 def step_from_cgt(t: float, cells_mv, temps_c, temp_quality, voltage_valid: bool, charge: bool, drain: bool) -> dict:

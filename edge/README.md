@@ -49,9 +49,22 @@ AI 판정은 세 모드 모두에서 돈다.
 | `classifier` ③ | 최근 20 s 창 | 누설, 과열 (이벤트 단위 100 %). ESR 정밀도가 낮아 ESR은 보고하지 않는다 |
 | `load_esr` | 부하 측정(CGP)과 직전 휴지 전압 | ESR (부하 재현율 98 %, 셀 식별 100 %, 오경보 0 %) |
 
+**새 모델 (2026-11-23)**: MLOps가 실측 복합 고장 데이터셋(2026-11-18\~20, 772 에피소드)으로 다시 학습했다.
+Pi 판정 규칙대로 에피소드를 재생해 비교한 test 결과다 (MLOps `docs/results/2026-11-23_fault_dataset.md`).
+
+| 패키지 | 이 코드 이전 버전에서 | test 결과 (v1 대비) |
+| --- | --- | --- |
+| `residual-v5`, `load_esr-v2` | 설치됨 (형식 같음) | 내부저항 탐지 81 → 88 %, 오경보 104 → 65건 |
+| 위 + `classifier-v3` (멀티레이블) | 이 버전부터 읽음 (이전 버전은 테스트 벡터에서 거절) | 오경보 104 → 12건, 정상 에피소드 오경보 0/27 |
+
+- **멀티레이블 ③** (`classifier_type: multilabel`): ESR·LEAK·HEAT 독립 확률이고, 모델 파일의 `thresholds` 이상이면 그 고장이다.
+  - 셀마다 `labels`(고장 목록)를 낸다. 한 셀의 누설+과열도 같이 낸다.
+  - `label`은 셀마다 대표 하나다. 기존 단일 레이블 모델은 예전과 같다.
+
 - **판정 확정 규칙**:
   - residual: 경보 3회 연속
   - classifier: 같은 고장이 3창 연속이고 확률 0.6 이상
+    - 멀티레이블 모델은 셀·고장마다 따로 센다. 모델 임계값 이상이 3창 연속이면 확정하고, 한 셀에 둘 이상 확정될 수 있다.
   - load_esr: 1회
 - **해제 규칙**: 경보 없음이 10회 이어지면 해제한다. 같은 (모델, 셀)은 해제 전까지 다시 보고하지 않는다.
 - **추론 부담**: Pi Zero 2 W에서 1초 측정 한 번에 약 26 ms. 수신 스레드와 따로 돈다.
@@ -84,12 +97,14 @@ AI 판정은 세 모드 모두에서 돈다.
 - **보고**: 결과는 MLOps `POST /edge/versions`와 MQTT `OTA_RESULT`로 보낸다.
 - **서버 경로**: OCI nginx의 `/edge-api/`가 MLOps(127.0.0.1:8400)의 엣지용 경로 4개만 연다. 헤더 `X-Edge-Token`이 맞아야 한다 (`deploy/nginx-cellguard.conf`). Pi는 토큰을 `secrets.env`의 `EDGE_TOKEN=`에서 읽는다.
 - **서버 없이 설치**: `cellguard-edge ota-install residual residual-v1.zip`. 같은 검증을 거친다. 설치하면 서비스가 바로 다시 읽는다.
+  - 새 모델: `ota-install residual residual-v5.zip`, `ota-install load_esr load_esr-v2.zip`, `ota-install classifier classifier-v3.zip`
 
 ## 설치 / 갱신 (Pi의 pi 계정, sudo 불필요)
 
 ```
 scp cellguard_edge.py cg_ai.py cellguard-edge.service install.sh cellguard:~/edge-src/
 scp tests/fixtures/*-v1.zip cellguard:~/edge-src/models/      # (선택) 서버 없이 v1 모델 설치
+scp tests/fixtures/residual-v5.zip tests/fixtures/load_esr-v2.zip tests/fixtures/classifier-v3.zip cellguard:~/edge-src/models/   # (선택) 새 모델
 ssh cellguard 'sh ~/edge-src/install.sh'
 ```
 
@@ -137,10 +152,11 @@ python -m pytest edge/tests -q
 
 | 파일 | 다루는 것 |
 | --- | --- |
-| `test_ai.py` | OTA 패키지 검증, 설치, 되돌리기, 테스트 벡터 불일치 거부, 판정 로직(과열 셀만 탐지, load_esr, 분류기 확정·해제) |
+| `test_ai.py` | OTA 패키지 검증, 설치, 되돌리기, 테스트 벡터 불일치 거부, 판정 로직(과열 셀만 탐지, load_esr, 분류기 확정·해제), 새 패키지 테스트 벡터, 멀티레이블 ③(셀별 고장 목록, 잘못된 설정 거부, 셀·고장별 확정·해제) |
 | `test_edge.py` | 모드 전환, 랜덤 고장 계획(복합·과열 먼저), 펌웨어 버전 판별, 동시 복합 고장 명령 순서(펄스는 OFF 없이, 고장별 정지), 판정과 정답 매칭·중복 억제, 균형 방전 구분, 에피소드 채점, CGT/CGP → AI 입력, 원격 명령 |
 
 `tests/fixtures/*-v1.zip`은 MLOps가 실측 15세션(2026-11-07~10)으로 학습해 만든 실제 OTA 패키지다.
+`residual-v5.zip`, `load_esr-v2.zip`, `classifier-v3.zip`은 실측 복합 고장 데이터셋으로 학습한 MLOps 서버의 패키지다 (② v5·부하 판정 v2는 MLOps 운영 버전, ③ v3는 엣지가 읽을 수 있게 되면 승격).
 
 ## 데이터 (Pi)
 
