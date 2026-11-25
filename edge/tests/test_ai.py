@@ -172,6 +172,65 @@ def test_detector_classifier_confirm_and_clear():
     assert ev == [] or ev[0]["event"] == "cleared"
 
 
+# MLOps가 실측 복합 고장 데이터셋(2026-11-18~20, 772 에피소드)으로 학습한 패키지. ③ v3는 멀티레이블
+NEW = {"residual": "residual-v5.zip", "load_esr": "load_esr-v2.zip", "classifier": "classifier-v3.zip"}
+
+
+def _zip_json(fname, member):
+    return json.loads(zipfile.ZipFile(FIX / fname).read(member))
+
+
+@pytest.mark.parametrize("name", cg_ai.MODEL_NAMES)
+def test_new_packages_pass_test_vectors(tmp_path, name):
+    data = (FIX / NEW[name]).read_bytes()
+    ok, detail, files, manifest = cg_ai.ModelSlot(tmp_path, name).verify(data, hashlib.sha256(data).hexdigest())
+    assert ok, detail
+
+
+def test_multilabel_classifier_outputs_fault_lists():
+    model = _zip_json(NEW["classifier"], "model.json")
+    vec = _zip_json(NEW["classifier"], "test_vectors.json")
+    clf = cg_ai.FaultClassifier(model)
+    outs = [o for o in (clf.update(cg_ai.as_step(s["input"])) for s in vec["steps"]) if o is not None]
+    assert outs and all(o["classifier_type"] == "multilabel" and o["probs"].shape == (4, 3) for o in outs)
+    thr = np.array([model["thresholds"][c] for c in outs[0]["classes"]])
+    for o in outs:
+        for k in range(4):
+            assert o["labels"][k] == [c for c, p, t in zip(o["classes"], o["probs"][k], thr) if p >= t]
+            if o["labels"][k]:
+                assert o["label"][k] in o["labels"][k]
+            else:
+                assert o["label"][k] == "normal"
+
+
+def test_multilabel_model_needs_sigmoid_and_thresholds():
+    model = _zip_json(NEW["classifier"], "model.json")
+    for bad in ({**model, "thresholds": {"leak": 0.9}}, {**model, "output_activation": "softmax"},
+                {**model, "classifier_type": "something"}):
+        with pytest.raises(ValueError):
+            cg_ai.FaultClassifier(bad)
+    single = cg_ai.FaultClassifier(_zip_json("classifier-v1.zip", "model.json"))   # 기존 모델은 그대로
+    assert not single.multi
+
+
+def test_detector_multilabel_confirms_each_fault_on_one_cell():
+    d = cg_ai.Detector({"ai_classifier_confirm_windows": 3, "ai_clear_steps": 2})
+
+    def out(labels):
+        return {"classifier_type": "multilabel", "classes": ["esr", "leak", "heat"],
+                "probs": np.full((4, 3), 0.95), "labels": labels}
+
+    both = out([["leak", "heat"], [], [], []])
+    assert d.classifier(both) == [] and d.classifier(both) == []
+    ev = d.classifier(both)
+    assert sorted(e["fault_type"] for e in ev) == ["HEAT", "LEAK"] and {e["cell"] for e in ev} == {1}
+    assert d.classifier(both) == [] and d.active_classifier() == {"1": "heat+leak"}
+    ev = [e for _ in range(2) for e in d.classifier(out([["heat"], [], [], []]))]
+    assert [(e["event"], e["class"]) for e in ev] == [("cleared", "leak")]      # 누설만 해제, 과열은 유지
+    ev = [e for _ in range(3) for e in d.classifier(out([["esr"], [], [], []]))]
+    assert [(e["event"], e["class"]) for e in ev] == [("cleared", "heat")]      # esr은 보고 안 함 (load_esr 몫)
+
+
 def test_step_from_cgt_quality_rules():
     s = cg_ai.step_from_cgt(1.0, [500, 510, 520, 530], [25.0, None, 26.0, 27.0],
                             ["VALID", "VALID", "SHORT_OR_LOW", "VALID"], True, True, False)
