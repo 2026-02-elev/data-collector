@@ -1001,6 +1001,9 @@ class Edge:
             raise Tripped(self.trip_reason())
         if self.mode() != self.running_mode and self.phase not in ("passive", "trip_recovery"):
             raise Paused()             # mode switched: stop this cycle/episode, the run loop starts the new mode
+        once = self._control().get("once")
+        if isinstance(once, dict) and once.get("id") != self.persist.get("once_done")                 and self.phase not in ("passive", "trip_recovery"):
+            raise Paused()             # one-shot command (charge/discharge/inject): the run loop runs it, then resumes the mode
 
     def _control(self) -> dict:
         return read_control(self.data)

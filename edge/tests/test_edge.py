@@ -391,3 +391,20 @@ def test_command_reset_history(tmp_path):
     e.tel.nano_state = "TRIPPED"                                         # a latched firmware trip gets a RESET
     assert "RESET ok" in command(e, command="reset_history")["note"]
     assert ("RESET",) in e.nano.cmds
+
+
+def test_one_shot_interrupts_a_running_mode(tmp_path):
+    """hold/discharge never return, so a pending one-shot must stop them (Paused) for the run loop to run it."""
+    e = make_edge(tmp_path)
+    e.nano = FakeNano()
+    e.nano.last_rx = time.monotonic()
+    e.nano.counters = {}
+    e.phase = "hold"
+    e.running_mode = "hold"
+    ce.set_mode(e.data, "hold")
+    e.tick()                                              # nothing pending: carries on
+    assert command(e, command="charge", target_mv=500)["ok"]
+    with pytest.raises(ce.Paused):
+        e.tick()
+    assert e._pending_once()["action"] == "charge"        # the run loop takes it ...
+    e.tick()                                              # ... and the mode carries on afterwards
