@@ -1108,6 +1108,8 @@ class Edge:
                 self.drain_to(self._clamp(once.get("target_mv"), self.cfg["discharge_target_mv"]))
             elif action == "inject":
                 self.demo_show(forced=once)
+                if self.phase != "trip_recovery":        # no cutoff: top the pack back up (ESR pulses drain it)
+                    self.charge_to(self.cfg["demo_target_mv"])
         finally:
             try:
                 if self.phase != "trip_recovery":
@@ -1511,6 +1513,11 @@ class Edge:
                 rec["pulses"] = k + 1
                 self.phase = "stim_esr"
                 self.wait(4)
+                # each pulse is a DRAIN load that discharges the whole series pack (~30 mV per pulse): once the AI
+                # has caught the injected ESR there is nothing more to show, so stop pulsing (demo / inject only)
+                if self.demo is not None and self.episode is not None and any(
+                        x["match"] == "injected" for x in self.episode["detections"]):
+                    break
             return
         name, bit = FEATURE[kind]
         if rt.get("profile") != 1 or not (rt.get("enabled", 0) >> bit) & 1:
