@@ -431,3 +431,25 @@ def test_forced_demo_show_reports_the_asked_fault(tmp_path):
     assert (start["forced"], start["fault_kind"], start["fault_cell"], start["ai_cutoff"]) == (True, "heat", 3, False)
     assert seen["demo"]["cutoff"] is False
     assert [d for d in sent(e, "diagnostics") if d["kind"] == "DEMO_RESULT"]
+
+
+def test_esr_injection_stops_pulsing_once_the_ai_caught_it(tmp_path):
+    """Every ESR pulse is a load that discharges the whole pack: demo/inject stop after the AI's first hit."""
+    e = make_edge(tmp_path)
+    e.nano = FakeNano()
+    e.tel.runtime = {"profile": 1, "enabled": 15, "passed": 1023}
+    e.tel.cells = [700, 702, 699, 701]
+    pulses = []
+    e.wait = lambda seconds, guard=None, until=None: None
+
+    def pulse(cell=None):
+        pulses.append(cell)
+        if len(pulses) == 2:                              # the AI reports the injected ESR after the 2nd pulse (1st is the reference)
+            e.episode["detections"].append({"t": 0, "model": "load_esr", "type": "ESR", "cell": 2, "match": "injected"})
+
+    e.load_pulse = pulse
+    ep = {"id": "x", "plan": {}, "applied": [], "detections": [], "skipped": [], "t0": time.monotonic()}
+    e.episode = ep
+    e.demo = {"ep": ep, "hit": None, "cut": None, "cutoff": False}
+    e.stimulus("esr", 2, pulses=5)
+    assert pulses == [None, 2]                            # reference + one injected pulse, not five
