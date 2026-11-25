@@ -228,3 +228,115 @@ def test_compound_overlap_skips_disabled_kind(tmp_path):
     e.need_cells = lambda: (_ for _ in ()).throw(AssertionError("must not touch the rig"))
     e.compound_overlap([{"kind": "heat", "cell": 1, "fraction": 1.0}, {"kind": "esr", "cell": 1, "pulses": 2}])
     assert [s["step"] for s in e.episode["skipped"]] == ["heat@1", "esr@1"]
+
+
+# ---- demo mode (시연): normal-looking run, one hidden random fault, AI detection -> TRIP
+def test_plan_demo(tmp_path):
+    e = make_edge(tmp_path)
+    rng = random.Random(3)
+    seen = set()
+    for _ in range(300):
+        p = e.plan_demo(rng)
+        seen.add(p["kind"])
+        assert p["shape"] == "single" and 1 <= p["cell"] <= 4
+        assert e.cfg["demo_normal_min_s"] <= p["normal_s"] <= e.cfg["demo_normal_max_s"]
+    assert seen == {"heat", "leak", "esr"}
+    assert "demo" in ce.MODES and ce.set_mode(tmp_path, "demo") == "demo"
+
+
+def armed_demo(e, kind="heat", cell=2):
+    ep = {"id": "r:d00001", "t0": time.monotonic(), "plan": {"shape": "single", "kind": kind, "cell": cell},
+          "applied": [], "skipped": [], "detections": []}
+    e.episode = ep
+    e.demo = {"ep": ep, "hit": None, "cut": None}
+    e.nano = FakeNano()
+    return ep
+
+
+def test_demo_ai_detection_trips_and_reports(tmp_path):
+    e = make_edge(tmp_path)
+    ep = armed_demo(e, "heat", 2)
+    e.fault_req = {"type": "HEAT", "cell_id": 2, "purpose": "injection"}
+    e._note_applied("heat", 2, seconds=20)
+    ep["applied"][0]["t"] -= 5.0
+    e._record_truth("HEAT", [2], time.monotonic())
+    e._on_ai_event({"model": "classifier", "event": "detected", "cell": 2, "fault_type": "HEAT", "prob": 0.97,
+                    "version": "v3"})
+    assert e.demo["hit"]["match"] == "injected"
+    with pytest.raises(ce.Tripped, match="HOST_TRIP"):
+        e._ai_cutoff(e.demo)
+    assert ("TRIP",) in e.nano.cmds and e.demo["cut"] is not None
+    cut = [d for d in sent(e, "diagnostics") if d["kind"] == "AI_CUTOFF"][0]["details"]
+    assert cut["fault_type"] == "HEAT" and cut["cell"] == 2 and cut["injected"] == {"type": "HEAT", "cell": 2}
+    assert cut["detect_latency_s"] >= 5.0
+    e._frame(["CGE", "40", "99000", "TRIP", "0", "0", "0", "HOST_TRIP"])       # the Nano confirms
+    tripped = [x for x in sent(e, "events") if x["event_type"] == "TRIPPED"][-1]
+    assert (tripped["fault_type"], tripped["cell_id"]) == ("HEAT", 2)
+    assert tripped["details"]["cause"] == "AI_CUTOFF" and tripped["details"]["model"] == "classifier"
+
+
+def test_demo_cutoff_policy(tmp_path):
+    e = make_edge(tmp_path)
+    armed_demo(e)
+    e.fault_req = {"type": "LEAK", "cell_id": 1, "purpose": "balance"}       # bleeding to balance: no cut
+    e._record_truth("LEAK", [1], time.monotonic())
+    e._on_ai_event({"model": "classifier", "event": "detected", "cell": 1, "fault_type": "LEAK", "prob": 0.9})
+    assert e.demo["hit"] is None
+    e2 = make_edge(tmp_path / "b", demo_cutoff_on="injected")                # false alarm: no cut
+    armed_demo(e2)
+    e2._on_ai_event({"model": "residual", "event": "detected", "cell": 3, "fault_type": "HEAT", "score": 9.0})
+    assert e2.demo["hit"] is None
+    e3 = make_edge(tmp_path / "c")                                           # default "any": it cuts
+    armed_demo(e3)
+    e3._on_ai_event({"model": "residual", "event": "detected", "cell": 3, "fault_type": "HEAT", "score": 9.0})
+    assert e3.demo["hit"]["match"] == "none"
+    e4 = make_edge(tmp_path / "d")                                           # not armed: diagnostic only
+    e4._on_ai_event({"model": "residual", "event": "detected", "cell": 3, "fault_type": "HEAT", "score": 9.0})
+    assert e4.demo is None
+
+
+def test_demo_trip_not_acknowledged_switches_off(tmp_path):
+    e = make_edge(tmp_path)
+    armed_demo(e)
+    e.demo["hit"] = {"model": "classifier", "fault_type": "HEAT", "cell": 2, "t": time.monotonic()}
+    e.nano.command = lambda name, *a, **k: e.nano.cmds.append((name, *a)) or (name != "TRIP", "BUSY")
+    with pytest.raises(ce.Skip):
+        e._ai_cutoff(e.demo)
+    assert e.nano.cmds[-1] == ("OFF",) and e.ai_cutoff is None
+
+
+def test_demo_show_cut_during_fault(tmp_path):
+    """Whole show with the rig stubbed: the fault starts, the AI fires, the next tick sends TRIP;
+    DEMO_RESULT names the cut, the demo index advances and the cutoff is not a 'trip to pause on'."""
+    e = make_edge(tmp_path, demo_normal_min_s=1, demo_normal_max_s=1)
+    e.nano = FakeNano()
+    e.tel.temps = [25.0] * 4
+    e.tel.cells = [700, 702, 699, 701]
+    e.start_session = lambda: None
+    e.charge_to = lambda target: None
+    e.wait = lambda seconds, guard=None, until=None: e.tick()
+    e.tick = lambda: (e._ai_cutoff(e.demo) if e.demo and e.demo["hit"] and e.demo["cut"] is None else None)
+    e.plan_demo = lambda rng: {"shape": "single", "kind": "leak", "cell": 4, "target_mv": 700, "normal_s": 1}
+
+    def stimulus(kind, cell, seconds=None, pulses=None, reference=True):
+        e.fault_req = {"type": "LEAK", "cell_id": cell, "purpose": "injection"}
+        e._note_applied(kind, cell, seconds=60)
+        e._record_truth("LEAK", [cell], time.monotonic())
+        e._on_ai_event({"model": "classifier", "event": "detected", "cell": cell, "fault_type": "LEAK",
+                        "prob": 0.95, "version": "v3"})
+        e.wait(1)
+
+    e.stimulus = stimulus
+    with pytest.raises(ce.Tripped):
+        e.demo_show()
+    assert e.demo is None and e.episode is None and e.persist["demo_index"] == 1
+    res = [d for d in sent(e, "diagnostics") if d["kind"] == "DEMO_RESULT"][0]["details"]
+    assert res["outcome"] == "cutoff" and res["detected"] == 1
+    assert res["cutoff"]["fault_type"] == "LEAK" and res["cutoff"]["cell"] == 4
+    start = [d for d in sent(e, "diagnostics") if d["kind"] == "DEMO_START"][0]["details"]
+    assert "kind" not in start and "cell" not in start                      # the plan stays hidden
+    resets = []
+    e._reset_after = lambda end: resets.append(round(end - time.monotonic()))
+    e._passive_sleep = lambda s: None
+    e.handle_trip("HOST_TRIP")
+    assert resets == [e.cfg["demo_recover_s"]] and len(e.trip_times) == 0 and e.ai_cutoff is None

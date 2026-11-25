@@ -6,10 +6,17 @@ Modes (control.json "mode", CLI `mode`, or MQTT cellguard/v1/{device}/command)
 - fault   : random episodes - none / single / compound faults (2-3 kinds). Nano >= 0.2.0
             runs them at the same time (HEAT + LEAK on, ESR load pulses during the overlap);
             0.1.9 allows one actuator at a time, so there they run back to back
+- demo    : presentation (시연). The pack runs like normal operation (charge, then hold and watch);
+            after a random 30..90 s ONE random fault is injected without announcement. The first
+            confirmed AI detection sends TRIP: the Nano cuts everything at once (HOST_TRIP), the server
+            gets diag AI_CUTOFF and a TRIPPED fault event naming the fault, cell and model. After
+            demo_recover_s the trip is reset and the next show starts.
 - passive : telemetry only, outputs off
 In every mode the AI models (MLOps residual / classifier / load_esr) judge each sample on the Pi.
 A confirmed anomaly is reported to the server (diag AI_DETECTION + fault_event OBSERVABLE) with
 the ground truth the Pi itself commanded, so the server can score the detector.
+Outside demo mode the AI is diagnostic only. In demo mode it may only make things safer: TRIP turns
+every output off; it never switches anything on or relaxes a firmware limit.
 Models are pulled from MLOps (OTA): production version changed -> download, checksum, test vectors
 -> install, keep the previous one, roll back if the model cannot be loaded.
 
@@ -27,7 +34,7 @@ Design rules
 Usage
   cellguard_edge.py run [--passive]           # service entry (systemd --user)
   cellguard_edge.py status                    # current status (status.json)
-  cellguard_edge.py mode collect|fault|passive
+  cellguard_edge.py mode collect|fault|demo|passive
   cellguard_edge.py pause | resume            # passive / back to the mode before pause
   cellguard_edge.py ota                       # check MLOps for new models now
   cellguard_edge.py ota-install NAME ZIP      # install a model package file (offline)
@@ -60,7 +67,7 @@ from pathlib import Path
 VERSION = "3.0.0"
 HOME = Path(__file__).resolve().parent
 sys.path.insert(0, str(HOME))
-MODES = ("collect", "fault", "passive")
+MODES = ("collect", "fault", "demo", "passive")
 DEFAULT_CONFIG = {
     "device_id": "cellguard-pi-01",
     "pack_id": "pack-01",
@@ -100,6 +107,16 @@ DEFAULT_CONFIG = {
     "fault_overlap": True,            # compound on Nano >= 0.2.0: faults at the same time (False: back to back)
     "fault_partial_min": 0.5,         # leak/heat stopped after a random 50..100 % of the firmware limit
     "episode_baseline_s": 30, "episode_hold_s": 20, "episode_post_s": 45, "episode_rest_s": 30,
+    # demo mode (시연): normal-looking run, one hidden random fault, AI detection -> TRIP
+    "demo_fault_kinds": ["heat", "leak", "esr"],
+    "demo_fault_weights": {"heat": 1.0, "leak": 1.0, "esr": 1.0},
+    "demo_normal_min_s": 30, "demo_normal_max_s": 90,   # normal operation before the injection
+    "demo_target_mv": 700,
+    "demo_esr_pulses": 5,             # ESR only shows under load: up to this many load pulses
+    "demo_watch_s": 30,               # keep watching after the fault ends (heat keeps rising)
+    "demo_recover_s": 60,             # stay TRIPPED this long (dashboard shows it), then RESET
+    "demo_rest_s": 20,                # pause between shows when nothing was cut
+    "demo_cutoff_on": "any",          # any confirmed AI detection cuts | "injected": only the injected fault
     # AI + OTA
     "ai_enabled": True,
     "models_dir": str(HOME / "models"),
@@ -242,11 +259,11 @@ class Outbox:
                 self.db.execute("COMMIT")
             if time.time() - self.last_trim > 600:
                 self.last_trim = time.time()
-                n = self.db.execute("SELECT COUNT(*) FROM msgs").fetchone()[0]
+                lo, hi = self._id_range()
+                n = hi - lo + 1 if hi else 0
                 if n > self.max_rows:
-                    self.db.execute("DELETE FROM msgs WHERE id IN (SELECT id FROM msgs ORDER BY id LIMIT ?)",
-                                    (n - self.max_rows,))
-                    log(f"outbox over cap: dropped {n - self.max_rows} oldest rows")
+                    self.db.execute("DELETE FROM msgs WHERE id <= ?", (hi - self.max_rows,))
+                    log(f"outbox over cap: dropped rows up to id {hi - self.max_rows}")
 
     def fetch(self, after: int, n: int) -> list:
         with self.lock:
@@ -261,9 +278,18 @@ class Outbox:
             self.db.executemany("DELETE FROM msgs WHERE id = ?", [(i,) for i in ids])
             self.db.execute("COMMIT")
 
+    def _id_range(self) -> tuple:
+        # MIN/MAX(rowid) is a b-tree lookup; COUNT(*) scans the whole table (500 MB on the SD card
+        # after a long offline spell) while holding the lock, which stalls the main loop and heartbeat
+        # (two subqueries: a single "SELECT MIN(id), MAX(id)" defeats SQLite's min/max optimisation)
+        lo, hi = self.db.execute("SELECT (SELECT MIN(id) FROM msgs), (SELECT MAX(id) FROM msgs)").fetchone()
+        return (lo or 0, hi or 0)
+
     def backlog(self) -> int:
+        """Upper bound (ids are AUTOINCREMENT; acked rows may leave small gaps)."""
         with self.lock:
-            return self.db.execute("SELECT COUNT(*) FROM msgs").fetchone()[0] + len(self.pending)
+            lo, hi = self._id_range()
+            return (hi - lo + 1 if hi else 0) + len(self.pending)
 
 
 def read_secrets(path: str) -> dict:
@@ -626,6 +652,8 @@ class Edge:
         self.episode = None            # fault mode: current episode bookkeeping
         self.reported: dict = {}       # (TYPE, cell) -> monotonic of the last OBSERVABLE event
         self.ai_events = collections.deque(maxlen=20)
+        self.demo = None               # demo mode: {"ep", "hit", "cut"} while the AI cutoff is armed
+        self.ai_cutoff = None          # the TRIP the Pi sent on an AI detection (until the trip is reset)
         self.running_mode = None
         ctl = self._control()
         self._ctl_seen = {"ota_at": ctl.get("ota_at"), "reload_at": ctl.get("reload_at")}
@@ -723,6 +751,10 @@ class Edge:
             if ep is not None:
                 ep["detections"].append({"t": now, "model": ev["model"], "type": ftype, "cell": ev["cell"],
                                          "match": match})
+            d = self.demo
+            if d is not None and d["hit"] is None and ftype in ("ESR", "LEAK", "HEAT", "ANOMALY") \
+                    and match != "balance" and (self.cfg["demo_cutoff_on"] != "injected" or match == "injected"):
+                d["hit"] = dict(ev, t=now)     # the main thread sends TRIP on its next tick
             if ftype in ("ESR", "LEAK", "HEAT"):
                 last = self.reported.get((ftype, ev["cell"]), -1e9)
                 if now - last >= self.cfg["ai_report_dedup_s"]:
@@ -887,7 +919,12 @@ class Edge:
                      firmware_version=self.tel.firmware)
             self.put("selftest", p)
         elif name == "TRIP":
-            self.fault_event("TRIPPED", "NONE", None, detail)
+            cut = self.ai_cutoff
+            if cut is not None and reason == "HOST_TRIP":
+                ftype = cut["fault_type"] if cut["fault_type"] in ("ESR", "LEAK", "HEAT") else "NONE"
+                self.fault_event("TRIPPED", ftype, cut["cell"], {**detail, "cause": "AI_CUTOFF", **cut["report"]})
+            else:
+                self.fault_event("TRIPPED", "NONE", None, detail)
         elif name in ("RESET", "BOOT"):
             self.fault_event(name, "NONE", None, detail)
         elif name.split("_")[0] in ("ESR", "LEAK", "HEAT") and name.endswith(("_START", "_STOP")):
@@ -952,6 +989,9 @@ class Edge:
             sd_notify("WATCHDOG=1")
         if now - self.nano.last_rx > 15:
             raise LinkError("no frames from Nano for 15 s")
+        d = self.demo
+        if d is not None and d["hit"] is not None and d["cut"] is None:
+            self._ai_cutoff(d)
         if self.tel.trip or self.tel.nano_state == "TRIPPED":
             raise Tripped(self.trip_reason())
         if self.mode() != self.running_mode and self.phase not in ("passive", "trip_recovery"):
@@ -1322,9 +1362,9 @@ class Edge:
             self.notes["pulse_few_cgp"] += 1
         return got
 
-    def stimulus(self, kind: str, cell: int, seconds=None, pulses=None) -> None:
+    def stimulus(self, kind: str, cell: int, seconds=None, pulses=None, reference=True) -> None:
         """One actuator probe. `seconds` (leak/heat) stops it early; None = full firmware limit.
-        ESR = a no-ESR reference pulse, then `pulses` load pulses with ESR on `cell`."""
+        ESR = a no-ESR reference pulse (unless reference=False), then `pulses` load pulses with ESR on `cell`."""
         self.phase = f"stim_{kind}"
         rt = self.tel.runtime or {}
         if kind == "control":
@@ -1341,8 +1381,9 @@ class Edge:
         if kind == "esr":
             if rt.get("profile") != 1 or not (rt.get("enabled", 0) >> bit) & 1:
                 raise Skip(f"{name} disabled by Nano runtime config {rt}")
-            self.load_pulse(None)              # reference right before
-            self.wait(3)
+            if reference:
+                self.load_pulse(None)          # reference right before
+                self.wait(3)
             self._note_applied("esr", cell, pulses=0)
             rec = self.episode["applied"][-1] if self.episode else {}
             for k in range(int(pulses or self.cfg["esr_pulses"])):
@@ -1671,6 +1712,115 @@ class Edge:
                                 "t_s": round(d["t"] - t0, 1)} for d in dets],
                 "duration_s": round(time.monotonic() - t0, 1)}
 
+    # -- demo mode (시연)
+    def plan_demo(self, rng: random.Random) -> dict:
+        c = self.cfg
+        kinds = list(c["demo_fault_kinds"])
+        w = c.get("demo_fault_weights") or {}
+        kind = rng.choices(kinds, weights=[float(w.get(k, 1.0)) for k in kinds])[0]
+        return {"shape": "single", "kind": kind, "cell": rng.randint(1, 4), "target_mv": int(c["demo_target_mv"]),
+                "normal_s": round(rng.uniform(c["demo_normal_min_s"], c["demo_normal_max_s"]), 1)}
+
+    def _ai_cutoff(self, d: dict) -> None:
+        """Main thread, from tick(): the AI confirmed a fault while the demo cutoff was armed -> TRIP."""
+        hit = d["hit"]
+        d["cut"] = now = time.monotonic()
+        inj = next((a for a in d["ep"]["applied"]), None)
+        report = {"model": hit.get("model"), "version": hit.get("version"), "match": hit.get("match"),
+                  "episode_id": d["ep"]["id"],
+                  "injected": None if inj is None else {"type": FEATURE[inj["kind"]][0], "cell": inj["cell"]},
+                  "detect_latency_s": None if inj is None else round(hit["t"] - inj["t"], 1),
+                  "cutoff_latency_s": round(now - hit["t"], 2),
+                  "scores": {k: hit[k] for k in ("score", "score_v", "score_t", "prob", "z") if k in hit}}
+        self.ai_cutoff = {"at": now, "fault_type": hit.get("fault_type"), "cell": hit.get("cell"), "report": report}
+        self.diag("AI_CUTOFF", f"{hit.get('model')} {hit.get('fault_type')} cell {hit.get('cell')}: TRIP",
+                  fault_type=hit.get("fault_type"), cell=hit.get("cell"), **report)
+        try:
+            ok, text = self.nano.command("TRIP", timeout=0.6, tries=3)
+        except LinkError as e:
+            ok, text = False, repr(e)
+        if not ok:                             # never leave the fault running: at least everything off
+            self.off("ai cutoff")
+            self.ai_cutoff = None
+            self.diag("AI_CUTOFF_FAILED", f"TRIP not acknowledged: {text}; outputs switched off instead")
+            raise Skip("AI cutoff: TRIP not acknowledged")
+        raise Tripped("HOST_TRIP")
+
+    def demo_show(self) -> None:
+        """One show: prepare (cool down, session, charge) -> normal operation for a random time ->
+        one random fault -> watch. The AI cutoff is armed from normal operation to the end of the watch."""
+        c = self.cfg
+        if time.monotonic() - self.run_start > c["run_rotate_hours"] * 3600:
+            self._new_run()
+        n = int(self.persist.get("demo_index", 0))
+        plan = self.plan_demo(random.Random())
+        ep = {"id": f"{self.run_id}:d{n:05d}", "plan": plan, "applied": [], "detections": [], "skipped": [],
+              "t0": time.monotonic(), "start_temps": list(self.tel.temps)}
+        self.cycle_id = ep["id"]
+        log(f"demo {n}: {plan}")
+        # the plan (which fault, where, when) stays on the Pi until DEMO_RESULT: the server learns of
+        # the fault the way an operator would, from the AI cutoff (telemetry still carries the masks)
+        self.diag("DEMO_START", f"demo {n}", episode_id=ep["id"], target_mv=plan["target_mv"])
+        outcome = "aborted"
+        try:
+            self.off()
+            hot = c["heat_start_max_c"] - 1.0
+            if not self.temps_ok(-50, hot):
+                self.phase = "demo_cooldown"
+                self.wait(c["heat_cooldown_max_s"], until=lambda: self.temps_ok(-50, hot))
+            self.phase = "demo_prep"
+            self.start_session()
+            try:
+                self.charge_to(plan["target_mv"])
+                s = self.tel.spread()
+                if s is not None and s > c["start_spread_max_mv"]:
+                    self.balance("balance_pre")
+            except Skip as e:
+                self.off()
+                ep["skipped"].append({"step": "prep", "why": str(e)})
+            self.off()
+            self.wait(3)
+            ep["start_temps"] = list(self.tel.temps)
+            self.episode = ep
+            self.demo = {"ep": ep, "hit": None, "cut": None}
+            self.diag("DEMO_ARMED", "AI cutoff armed", episode_id=ep["id"])
+            self.phase = "demo_operating"
+            self.wait(plan["normal_s"])
+            kind, cell = plan["kind"], plan["cell"]
+            try:
+                if kind == "esr":
+                    # no reference pulse: it is a dataset label aid, not "normal operation", and load_esr v2
+                    # flags cell 4 on it (z 4-5 with no ESR active), which would cut off before the fault
+                    self.stimulus("esr", cell, pulses=c["demo_esr_pulses"], reference=False)
+                else:
+                    self.stimulus(kind, cell)          # up to the firmware limit; the cutoff ends it early
+            except Skip as e:
+                self.off()
+                ep["skipped"].append({"step": f"{kind}@{cell}", "why": str(e)})
+            self.phase = "demo_watch"
+            self.wait(c["demo_watch_s"])
+            outcome = "missed" if ep["applied"] else "not_injected"
+        except Tripped:
+            d = self.demo
+            outcome = "cutoff" if d is not None and d["cut"] is not None else "firmware_trip"
+            raise
+        finally:
+            d, self.demo, self.episode = self.demo, None, None
+            self.off()
+            self.persist["demo_index"] = n + 1
+            self._save_state()
+            hit = d and d["hit"]
+            res = self.score_episode(ep, outcome)
+            res["cutoff"] = None if not (d and d["cut"]) else {
+                k: hit.get(k) for k in ("model", "version", "fault_type", "cell", "match")}
+            if res["cutoff"] is not None and ep["applied"]:
+                res["cutoff"]["detect_latency_s"] = round(hit["t"] - ep["applied"][0]["t"], 1)
+            elif res["cutoff"] is not None:
+                res["cutoff"]["before_injection"] = True
+            self.diag("DEMO_RESULT", f"demo {n} {outcome}", **res)
+        self.phase = "demo_rest"
+        self.wait(c["demo_rest_s"])
+
     def cycle(self) -> None:
         c = self.cfg
         if time.monotonic() - self.run_start > c["run_rotate_hours"] * 3600:
@@ -1709,16 +1859,33 @@ class Edge:
     # -- recovery
     def handle_trip(self, reason: str) -> None:
         self.phase = "trip_recovery"
-        self.trip_times.append(time.monotonic())
+        cut = self.ai_cutoff
+        demo_cut = reason == "HOST_TRIP" and cut is not None and time.monotonic() - cut["at"] < 60
+        if not demo_cut:                   # a demo cutoff is wanted: it must not pause the experiments
+            self.trip_times.append(time.monotonic())
         self.off("trip")
         if reason in ("NONE", "UNKNOWN"):   # CGS can report TRIPPED a moment before CGX/CGE arrive
             self._passive_sleep(1)
             reason = self.trip_reason()
         self.notes[f"trip_{reason}"] += 1
-        self.diag("TRIP_RECOVERY", f"firmware trip {reason}: outputs off, waiting",
-                  trip=reason, cells=self.tel.cells, temps=self.tel.temps)
+        c = self.cfg
+        if demo_cut:
+            self.diag("TRIP_RECOVERY", f"AI cutoff (HOST_TRIP): outputs off, reset in {c['demo_recover_s']} s",
+                      trip=reason, cause="AI_CUTOFF", cells=self.tel.cells, temps=self.tel.temps)
+        else:
+            self.diag("TRIP_RECOVERY", f"firmware trip {reason}: outputs off, waiting",
+                      trip=reason, cells=self.tel.cells, temps=self.tel.temps)
+        try:
+            self._trip_wait(reason, demo_cut)
+        finally:
+            self.ai_cutoff = None
+
+    def _trip_wait(self, reason: str, demo_cut: bool) -> None:
         c = self.cfg
         now = time.monotonic()
+        if demo_cut:
+            self._reset_after(now + c["demo_recover_s"])
+            return
         recent = sum(1 for t in self.trip_times if now - t < 3600)
         self.charge_noresp = self.charge_noresp + 1 if reason == "CHARGE_NO_RESPONSE" else 0
         # once the charge path was found open, one more no-response is enough to pause again (longer)
@@ -1740,7 +1907,10 @@ class Edge:
             self.pause_until = now + c["trip_pause_s"]
             self.diag("TRIP_PAUSE", f"{recent} trips in 1 h: experiments paused {c['trip_pause_s']} s "
                       "(telemetry continues)")
-        end = time.monotonic() + c["trip_wait_s"]
+        self._reset_after(time.monotonic() + c["trip_wait_s"])
+
+    def _reset_after(self, end: float) -> None:
+        """Telemetry only until `end`, then RESET the trip (retried with back-off while the Nano refuses)."""
         backoff = 0
         while True:
             left = end - time.monotonic()
@@ -1847,6 +2017,8 @@ class Edge:
                 self.running_mode = mode
                 if mode == "fault":
                     self.fault_episode()
+                elif mode == "demo":
+                    self.demo_show()
                 else:
                     self.cycle()
                 link_failures = 0
@@ -1987,6 +2159,7 @@ def main() -> int:
         mode = set_mode(data, req)
         print("mode ->", {"collect": "collect (systematic data collection cycle)",
                           "fault": "fault (random single/compound fault episodes, AI judged)",
+                          "demo": "demo (normal-looking run, one hidden random fault, AI detection -> TRIP)",
                           "passive": "passive (telemetry only, outputs off)"}[mode])
         return 0
     if a.command == "ota":
