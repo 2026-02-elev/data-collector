@@ -1882,7 +1882,7 @@ class Edge:
         # the plan (which fault, where, when) stays on the Pi until DEMO_RESULT: the server learns of
         # the fault the way an operator would, from the AI cutoff (telemetry still carries the masks)
         self.diag("DEMO_START", f"demo {n}", episode_id=ep["id"], target_mv=plan["target_mv"],
-                  **({"forced": True, "kind": plan["kind"], "cell": plan["cell"],
+                  **({"forced": True, "fault_kind": plan["kind"], "fault_cell": plan["cell"],
                       "ai_cutoff": bool(forced.get("ai_cutoff", True))} if forced else {}))
         outcome = "aborted"
         try:
@@ -2292,6 +2292,8 @@ def main() -> int:
         print("mode ->", {"collect": "collect (systematic data collection cycle)",
                           "fault": "fault (random single/compound fault episodes, AI judged)",
                           "demo": "demo (normal-looking run, one hidden random fault, AI detection -> TRIP)",
+                          "hold": "hold (charge to --target and keep the cells there)",
+                          "discharge": "discharge (drain to the target, then idle)",
                           "passive": "passive (telemetry only, outputs off)"}[mode])
         return 0
     if a.command == "ota":

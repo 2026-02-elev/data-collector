@@ -408,3 +408,26 @@ def test_one_shot_interrupts_a_running_mode(tmp_path):
         e.tick()
     assert e._pending_once()["action"] == "charge"        # the run loop takes it ...
     e.tick()                                              # ... and the mode carries on afterwards
+
+
+def test_forced_demo_show_reports_the_asked_fault(tmp_path):
+    """inject from the dashboard = demo_show(forced): DEMO_START names the fault (diag has its own `kind` argument,
+    so the detail keys must not clash), and ai_cutoff=False keeps the cutoff off."""
+    e = make_edge(tmp_path)
+    e.nano = FakeNano()
+    e.tel.temps = [25.0] * 4
+    e.tel.cells = [700, 702, 699, 701]
+    e.start_session = lambda: None
+    e.charge_to = lambda target: None
+    seen = {}
+
+    def stimulus(kind, cell, seconds=None, pulses=None, reference=True):
+        seen["demo"] = dict(e.demo)
+
+    e.stimulus = stimulus
+    e.wait = lambda seconds, guard=None, until=None: None
+    e.demo_show(forced={"kind": "heat", "cell": 3, "ai_cutoff": False})
+    start = [d for d in sent(e, "diagnostics") if d["kind"] == "DEMO_START"][0]["details"]
+    assert (start["forced"], start["fault_kind"], start["fault_cell"], start["ai_cutoff"]) == (True, "heat", 3, False)
+    assert seen["demo"]["cutoff"] is False
+    assert [d for d in sent(e, "diagnostics") if d["kind"] == "DEMO_RESULT"]
