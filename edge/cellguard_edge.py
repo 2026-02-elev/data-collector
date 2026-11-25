@@ -34,7 +34,7 @@ Design rules
 Usage
   cellguard_edge.py run [--passive]           # service entry (systemd --user)
   cellguard_edge.py status                    # current status (status.json)
-  cellguard_edge.py mode collect|fault|demo|passive
+  cellguard_edge.py mode collect|fault|demo|passive|hold|discharge
   cellguard_edge.py pause | resume            # passive / back to the mode before pause
   cellguard_edge.py ota                       # check MLOps for new models now
   cellguard_edge.py ota-install NAME ZIP      # install a model package file (offline)
@@ -67,7 +67,7 @@ from pathlib import Path
 VERSION = "3.0.0"
 HOME = Path(__file__).resolve().parent
 sys.path.insert(0, str(HOME))
-MODES = ("collect", "fault", "demo", "passive")
+MODES = ("collect", "fault", "demo", "passive", "hold", "discharge")
 DEFAULT_CONFIG = {
     "device_id": "cellguard-pi-01",
     "pack_id": "pack-01",
@@ -117,6 +117,10 @@ DEFAULT_CONFIG = {
     "demo_recover_s": 60,             # stay TRIPPED this long (dashboard shows it), then RESET
     "demo_rest_s": 20,                # pause between shows when nothing was cut
     "demo_cutoff_on": "any",          # any confirmed AI detection cuts | "injected": only the injected fault
+    # operator modes/commands from the dashboard
+    "hold_target_mv": 700, "hold_top_up_mv": 30, "hold_recheck_s": 15,
+    "discharge_target_mv": 400,
+    "cmd_min_target_mv": 150, "cmd_max_target_mv": 950,
     # AI + OTA
     "ai_enabled": True,
     "models_dir": str(HOME / "models"),
@@ -752,7 +756,8 @@ class Edge:
                 ep["detections"].append({"t": now, "model": ev["model"], "type": ftype, "cell": ev["cell"],
                                          "match": match})
             d = self.demo
-            if d is not None and d["hit"] is None and ftype in ("ESR", "LEAK", "HEAT", "ANOMALY") \
+            if d is not None and d.get("cutoff", True) and d["hit"] is None \
+                and ftype in ("ESR", "LEAK", "HEAT", "ANOMALY") \
                     and match != "balance" and (self.cfg["demo_cutoff_on"] != "injected" or match == "injected"):
                 d["hit"] = dict(ev, t=now)     # the main thread sends TRIP on its next tick
             if ftype in ("ESR", "LEAK", "HEAT"):
@@ -996,6 +1001,9 @@ class Edge:
             raise Tripped(self.trip_reason())
         if self.mode() != self.running_mode and self.phase not in ("passive", "trip_recovery"):
             raise Paused()             # mode switched: stop this cycle/episode, the run loop starts the new mode
+        once = self._control().get("once")
+        if isinstance(once, dict) and once.get("id") != self.persist.get("once_done")                 and self.phase not in ("passive", "trip_recovery"):
+            raise Paused()             # one-shot command (charge/discharge/inject): the run loop runs it, then resumes the mode
 
     def _control(self) -> dict:
         return read_control(self.data)
@@ -1011,10 +1019,28 @@ class Edge:
             ok, note = True, ""
             if name == "mode" and c.get("mode") in MODES:
                 set_mode(self.data, c["mode"])
-                note = f"mode -> {c['mode']}"
+                params = {"target_mv": self._clamp(c["target_mv"], 0)} if c.get("target_mv") is not None else {}
+                write_control(self.data, params=params)
+                note = f"mode -> {c['mode']}" + (f" ({params['target_mv']} mV)" if params else "")
             elif name in ("pause", "resume"):
                 set_mode(self.data, name)
                 note = name
+            elif name in ("charge", "discharge"):
+                default = self.cfg["hold_target_mv"] if name == "charge" else self.cfg["discharge_target_mv"]
+                target = self._clamp(c.get("target_mv"), default)
+                write_control(self.data, once={"id": time.time(), "action": name, "target_mv": target})
+                note = f"{name} to {target} mV"
+            elif name == "inject":
+                kind, cell = c.get("kind"), c.get("cell")
+                if kind in ("heat", "leak", "esr") and cell in (1, 2, 3, 4):
+                    once = {"id": time.time(), "action": "inject", "kind": kind, "cell": cell,
+                            "ai_cutoff": bool(c.get("ai_cutoff", True))}
+                    write_control(self.data, once=once)
+                    note = f"inject {kind} on cell {cell}"
+                else:
+                    ok, note = False, "inject needs kind heat|leak|esr and cell 1..4"
+            elif name == "reset_history":
+                note = self._reset_history()
             elif name == "ota_check":
                 self.ota_wake.set()
                 note = "OTA check requested" if self.ota else f"AI off: {self.ai_disabled}"
@@ -1024,6 +1050,99 @@ class Edge:
             else:
                 ok, note = False, "unknown command"
             self.diag("COMMAND_ACK", note, command=c, ok=ok, status=self._status_dict(brief=True))
+
+    def _clamp(self, value, default: int) -> int:
+        """A target in mV from a command, kept inside the range the rig can do."""
+        c = self.cfg
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            v = int(default)
+        return max(c["cmd_min_target_mv"], min(c["cmd_max_target_mv"], v)) if v else int(default)
+
+    def _param(self, key: str, default: int) -> int:
+        p = self._control().get("params") or {}
+        return self._clamp(p.get(key), default)
+
+    def _reset_history(self) -> str:
+        """Operator 'reset history': forget trips and pauses so experiments/commands start fresh,
+        and clear a latched firmware trip."""
+        n = len(self.trip_times)
+        self.trip_times.clear()
+        self.charge_noresp = 0
+        self.charger_pauses = 0
+        self.pause_until = 0.0
+        self.pause_reason = None
+        self.ai_cutoff = None
+        for key in [k for k in self.notes if k.startswith("trip_")]:
+            del self.notes[key]
+        note = f"history cleared ({n} trips forgotten)"
+        if self.tel.trip or self.tel.nano_state == "TRIPPED":
+            try:
+                ok, text = self.nano.command("RESET", timeout=0.6, tries=3)
+                note += "; Nano RESET " + ("ok" if ok or text == "NOT_TRIPPED" else f"refused: {text}")
+                if ok:
+                    self.tel.last_trip = None
+            except (LinkError, NoSync) as e:
+                note += f"; Nano RESET failed: {e}"
+        return note
+
+    def _pending_once(self):
+        """A one-shot command (charge / discharge / inject) written by _poll_commands, taken at most once."""
+        once = self._control().get("once")
+        if not isinstance(once, dict) or once.get("id") == self.persist.get("once_done"):
+            return None
+        self.persist["once_done"] = once.get("id")
+        self._save_state()
+        return once
+
+    def run_once(self, once: dict) -> None:
+        action = once.get("action")
+        self.diag("ONCE_START", f"{action}", once=once, cells=self.tel.cells)
+        try:
+            if action == "charge":
+                self.start_session()
+                self.charge_to(self._clamp(once.get("target_mv"), self.cfg["hold_target_mv"]))
+            elif action == "discharge":
+                self.start_session()
+                self.drain_to(self._clamp(once.get("target_mv"), self.cfg["discharge_target_mv"]))
+            elif action == "inject":
+                self.demo_show(forced=once)
+        finally:
+            try:
+                if self.phase != "trip_recovery":
+                    self.off()
+            except (LinkError, NoSync):
+                pass
+        self.diag("ONCE_DONE", f"{action} done", once=once, cells=self.tel.cells, temps=self.tel.temps)
+
+    def hold_mode(self) -> None:
+        """Charge to a target, then keep the cells there (top up when the highest cell sags)."""
+        c = self.cfg
+        self.cycle_id = f"{self.run_id}:hold"
+        self.start_session()
+        self.charge_to(self._param("target_mv", c["hold_target_mv"]))
+        while True:
+            self.phase = "hold"
+            self.wait(c["hold_recheck_s"])
+            target = self._param("target_mv", c["hold_target_mv"])
+            if max(self.need_cells()) < target - c["hold_top_up_mv"]:
+                self.charge_to(target)
+
+    def discharge_mode(self) -> None:
+        """Drain to a target (never below the firmware floor), then idle with outputs off."""
+        c = self.cfg
+        self.cycle_id = f"{self.run_id}:discharge"
+        self.start_session()
+        self.drain_to(self._param("target_mv", c["discharge_target_mv"]))
+        self.off()
+        while True:
+            self.phase = "discharge_done"
+            self.wait(c["hold_recheck_s"])
+            target = self._param("target_mv", c["discharge_target_mv"])
+            if min(self.need_cells()) > target + 40:
+                self.drain_to(target)
+                self.off()
 
     def trip_reason(self) -> str:
         if self.tel.trip:
@@ -1746,7 +1865,7 @@ class Edge:
             raise Skip("AI cutoff: TRIP not acknowledged")
         raise Tripped("HOST_TRIP")
 
-    def demo_show(self) -> None:
+    def demo_show(self, forced: dict | None = None) -> None:
         """One show: prepare (cool down, session, charge) -> normal operation for a random time ->
         one random fault -> watch. The AI cutoff is armed from normal operation to the end of the watch."""
         c = self.cfg
@@ -1754,13 +1873,17 @@ class Edge:
             self._new_run()
         n = int(self.persist.get("demo_index", 0))
         plan = self.plan_demo(random.Random())
+        if forced is not None:             # operator asked for this exact fault: short normal run, then inject
+            plan = {**plan, "kind": forced["kind"], "cell": int(forced["cell"]), "normal_s": 8.0}
         ep = {"id": f"{self.run_id}:d{n:05d}", "plan": plan, "applied": [], "detections": [], "skipped": [],
               "t0": time.monotonic(), "start_temps": list(self.tel.temps)}
         self.cycle_id = ep["id"]
         log(f"demo {n}: {plan}")
         # the plan (which fault, where, when) stays on the Pi until DEMO_RESULT: the server learns of
         # the fault the way an operator would, from the AI cutoff (telemetry still carries the masks)
-        self.diag("DEMO_START", f"demo {n}", episode_id=ep["id"], target_mv=plan["target_mv"])
+        self.diag("DEMO_START", f"demo {n}", episode_id=ep["id"], target_mv=plan["target_mv"],
+                  **({"forced": True, "fault_kind": plan["kind"], "fault_cell": plan["cell"],
+                      "ai_cutoff": bool(forced.get("ai_cutoff", True))} if forced else {}))
         outcome = "aborted"
         try:
             self.off()
@@ -1782,7 +1905,8 @@ class Edge:
             self.wait(3)
             ep["start_temps"] = list(self.tel.temps)
             self.episode = ep
-            self.demo = {"ep": ep, "hit": None, "cut": None}
+            self.demo = {"ep": ep, "hit": None, "cut": None,
+                         "cutoff": True if forced is None else bool(forced.get("ai_cutoff", True))}
             self.diag("DEMO_ARMED", "AI cutoff armed", episode_id=ep["id"])
             self.phase = "demo_operating"
             self.wait(plan["normal_s"])
@@ -2004,6 +2128,10 @@ class Edge:
                 if self.tel.trip or self.tel.nano_state == "TRIPPED":
                     raise Tripped(self.trip_reason())
                 mode = self.mode()
+                once = None if time.monotonic() < self.pause_until else self._pending_once()
+                if once is not None:
+                    self.run_once(once)
+                    continue
                 if mode == "passive" or time.monotonic() < self.pause_until:
                     if self.phase != "passive":
                         self.off("passive")
@@ -2019,6 +2147,10 @@ class Edge:
                     self.fault_episode()
                 elif mode == "demo":
                     self.demo_show()
+                elif mode == "hold":
+                    self.hold_mode()
+                elif mode == "discharge":
+                    self.discharge_mode()
                 else:
                     self.cycle()
                 link_failures = 0
@@ -2160,6 +2292,8 @@ def main() -> int:
         print("mode ->", {"collect": "collect (systematic data collection cycle)",
                           "fault": "fault (random single/compound fault episodes, AI judged)",
                           "demo": "demo (normal-looking run, one hidden random fault, AI detection -> TRIP)",
+                          "hold": "hold (charge to --target and keep the cells there)",
+                          "discharge": "discharge (drain to the target, then idle)",
                           "passive": "passive (telemetry only, outputs off)"}[mode])
         return 0
     if a.command == "ota":

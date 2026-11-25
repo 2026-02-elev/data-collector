@@ -340,3 +340,94 @@ def test_demo_show_cut_during_fault(tmp_path):
     e._passive_sleep = lambda s: None
     e.handle_trip("HOST_TRIP")
     assert resets == [e.cfg["demo_recover_s"]] and len(e.trip_times) == 0 and e.ai_cutoff is None
+
+
+# ---- operator commands from the dashboard: modes with a target, one-shots, reset history
+def command(e, **cmd):
+    e.pub.commands.put(cmd)
+    e._poll_commands()
+    ack = [d for d in sent(e, "diagnostics") if d["kind"] == "COMMAND_ACK"][-1]
+    return {**ack["details"], "note": ack["message"]}
+
+
+def test_command_modes_hold_and_discharge(tmp_path):
+    e = make_edge(tmp_path)
+    assert {"hold", "discharge"} <= set(ce.MODES)
+    ack = command(e, command="mode", mode="hold", target_mv=650)
+    assert ack["ok"] and ce.read_control(e.data)["mode"] == "hold"
+    assert e._param("target_mv", 700) == 650
+    command(e, command="mode", mode="discharge", target_mv=99999)        # clamped to what the rig can do
+    assert e._param("target_mv", 400) == e.cfg["cmd_max_target_mv"]
+    command(e, command="mode", mode="demo")                              # no target: params cleared
+    assert e._param("target_mv", 700) == 700
+
+
+def test_command_one_shots_run_once(tmp_path):
+    e = make_edge(tmp_path)
+    assert e._pending_once() is None
+    assert command(e, command="charge", target_mv=600)["ok"]
+    once = e._pending_once()
+    assert once["action"] == "charge" and once["target_mv"] == 600
+    assert e._pending_once() is None                                     # the same command never runs twice
+    assert command(e, command="inject", kind="heat", cell=3, ai_cutoff=False)["ok"]
+    once = e._pending_once()
+    assert (once["action"], once["kind"], once["cell"], once["ai_cutoff"]) == ("inject", "heat", 3, False)
+    assert not command(e, command="inject", kind="smoke", cell=9)["ok"]  # unknown fault / cell refused
+    assert e._pending_once() is None
+
+
+def test_command_reset_history(tmp_path):
+    e = make_edge(tmp_path)
+    e.nano = FakeNano()
+    e.trip_times.extend([1.0, 2.0, 3.0])
+    e.pause_until = time.monotonic() + 3600
+    e.pause_reason = "3 trips in the last hour"
+    e.charge_noresp, e.charger_pauses = 2, 1
+    e.notes["trip_OVER_TEMPERATURE"] += 2
+    ack = command(e, command="reset_history")
+    assert ack["ok"] and "3 trips" in ack["note"]
+    assert not e.trip_times and e.pause_until == 0.0 and e.pause_reason is None
+    assert (e.charge_noresp, e.charger_pauses) == (0, 0) and "trip_OVER_TEMPERATURE" not in e.notes
+    e.tel.nano_state = "TRIPPED"                                         # a latched firmware trip gets a RESET
+    assert "RESET ok" in command(e, command="reset_history")["note"]
+    assert ("RESET",) in e.nano.cmds
+
+
+def test_one_shot_interrupts_a_running_mode(tmp_path):
+    """hold/discharge never return, so a pending one-shot must stop them (Paused) for the run loop to run it."""
+    e = make_edge(tmp_path)
+    e.nano = FakeNano()
+    e.nano.last_rx = time.monotonic()
+    e.nano.counters = {}
+    e.phase = "hold"
+    e.running_mode = "hold"
+    ce.set_mode(e.data, "hold")
+    e.tick()                                              # nothing pending: carries on
+    assert command(e, command="charge", target_mv=500)["ok"]
+    with pytest.raises(ce.Paused):
+        e.tick()
+    assert e._pending_once()["action"] == "charge"        # the run loop takes it ...
+    e.tick()                                              # ... and the mode carries on afterwards
+
+
+def test_forced_demo_show_reports_the_asked_fault(tmp_path):
+    """inject from the dashboard = demo_show(forced): DEMO_START names the fault (diag has its own `kind` argument,
+    so the detail keys must not clash), and ai_cutoff=False keeps the cutoff off."""
+    e = make_edge(tmp_path)
+    e.nano = FakeNano()
+    e.tel.temps = [25.0] * 4
+    e.tel.cells = [700, 702, 699, 701]
+    e.start_session = lambda: None
+    e.charge_to = lambda target: None
+    seen = {}
+
+    def stimulus(kind, cell, seconds=None, pulses=None, reference=True):
+        seen["demo"] = dict(e.demo)
+
+    e.stimulus = stimulus
+    e.wait = lambda seconds, guard=None, until=None: None
+    e.demo_show(forced={"kind": "heat", "cell": 3, "ai_cutoff": False})
+    start = [d for d in sent(e, "diagnostics") if d["kind"] == "DEMO_START"][0]["details"]
+    assert (start["forced"], start["fault_kind"], start["fault_cell"], start["ai_cutoff"]) == (True, "heat", 3, False)
+    assert seen["demo"]["cutoff"] is False
+    assert [d for d in sent(e, "diagnostics") if d["kind"] == "DEMO_RESULT"]
